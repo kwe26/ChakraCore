@@ -265,13 +265,7 @@ HRESULT ChakraRTInterface::ParseConfigFlags()
         char16* fileNameWide = nullptr;
         hr = GetFileNameFlag(&fileNameWide);
 
-        if (hr != S_OK)
-        {
-            wprintf(_u("Error: no script file specified."));
-            m_argInfo->hostPrintUsage();
-            m_usageStringPrinted = true;
-        }
-        else
+        if (hr == S_OK && fileNameWide != nullptr && fileNameWide[0] != _u('\0'))
         {
             hr = WideStringToNarrowDynamic(fileNameWide, &m_argInfo->filename);
             SysFreeString(fileNameWide);
@@ -281,6 +275,16 @@ HRESULT ChakraRTInterface::ParseConfigFlags()
                 wprintf(_u("Error: Ran out of memory"));
                 return hr;
             }
+        }
+        else
+        {
+            if (fileNameWide != nullptr)
+            {
+                SysFreeString(fileNameWide);
+            }
+
+            m_argInfo->filename = nullptr;
+            hr = S_OK;
         }
     }
 

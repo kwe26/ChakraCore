@@ -78,19 +78,21 @@ int HostExceptionFilter(int exceptionCode, _EXCEPTION_POINTERS *ep)
 
 void __stdcall PrintUsageFormat()
 {
-    wprintf(_u("\nUsage: %s [-v|-version] [-h|-help] [-?] [flaglist] <source file>\n"), hostName);
+    wprintf(_u("\nUsage: %s [-v|-version] [-h|-help] [-?] [flaglist] [source file]\n"), hostName);
     wprintf(_u("\t-v|-version\t\tDisplays version info\n"));
     wprintf(_u("\t-h|-help\t\tDisplays this help message\n"));
     wprintf(_u("\t-?\t\t\tDisplays this help message with complete [flaglist] info\n"));
+    wprintf(_u("\t(no source file)\tStarts an interactive REPL\n"));
 }
 
 #if !defined(ENABLE_DEBUG_CONFIG_OPTIONS)
 void __stdcall PrintReleaseUsage()
 {
-    wprintf(_u("\nUsage: %s [-v|-version] [-h|-help|-?] <source file> %s"), hostName,
+    wprintf(_u("\nUsage: %s [-v|-version] [-h|-help|-?] [source file] %s"), hostName,
         _u("\nNote: [flaglist] is not supported in Release builds; try a Debug or Test build to enable these flags.\n"));
     wprintf(_u("\t-v|-version\t\tDisplays version info\n"));
     wprintf(_u("\t-h|-help|-?\t\tDisplays this help message\n"));
+    wprintf(_u("\t(no source file)\tStarts an interactive REPL\n"));
 }
 #endif
 
@@ -169,6 +171,170 @@ void __stdcall PrintVersion()
 #ifdef _WIN32
     PrintChakraCoreVersion();
 #endif
+}
+
+const char* REPL_SOURCE_NAME = "repl";
+
+bool IsWhitespaceChar(char ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
+}
+
+bool IsReplExitCommand(const char* line)
+{
+    if (line == nullptr)
+    {
+        return false;
+    }
+
+    const char* start = line;
+    while (*start != '\0' && IsWhitespaceChar(*start))
+    {
+        start++;
+    }
+
+    const char* end = start + strlen(start);
+    while (end > start && IsWhitespaceChar(*(end - 1)))
+    {
+        end--;
+    }
+
+    size_t length = static_cast<size_t>(end - start);
+    return
+        (length == 5 && strncmp(start, ".exit", length) == 0) ||
+        (length == 4 && strncmp(start, "exit", length) == 0) ||
+        (length == 4 && strncmp(start, "quit", length) == 0);
+}
+
+char* ReadReplLine()
+{
+    const int initialBufferSize = 256;
+    int length = 0;
+    int bufferSize = initialBufferSize;
+    char* buffer = static_cast<char*>(malloc(bufferSize));
+    if (buffer == nullptr)
+    {
+        return nullptr;
+    }
+
+    buffer[0] = '\0';
+
+    while (true)
+    {
+        if (fgets(buffer + length, bufferSize - length, stdin) == nullptr)
+        {
+            if (length == 0)
+            {
+                free(buffer);
+                return nullptr;
+            }
+
+            break;
+        }
+
+        length += static_cast<int>(strlen(buffer + length));
+
+        if (length > 0 && buffer[length - 1] == '\n')
+        {
+            buffer[--length] = '\0';
+            if (length > 0 && buffer[length - 1] == '\r')
+            {
+                buffer[--length] = '\0';
+            }
+            break;
+        }
+
+        if (length < bufferSize - 1)
+        {
+            break;
+        }
+
+        int newBufferSize = bufferSize * 2;
+        if (newBufferSize <= bufferSize)
+        {
+            free(buffer);
+            return nullptr;
+        }
+
+        char* expandedBuffer = static_cast<char*>(realloc(buffer, newBufferSize));
+        if (expandedBuffer == nullptr)
+        {
+            free(buffer);
+            return nullptr;
+        }
+
+        buffer = expandedBuffer;
+        bufferSize = newBufferSize;
+    }
+
+    return buffer;
+}
+
+void PrintReplResult(JsValueRef value)
+{
+    JsValueRef stringValue = JS_INVALID_REFERENCE;
+    JsErrorCode errorCode = ChakraRTInterface::JsConvertValueToString(value, &stringValue);
+    if (errorCode != JsNoError)
+    {
+        WScriptJsrt::PrintException(REPL_SOURCE_NAME, errorCode);
+        return;
+    }
+
+    AutoString resultString(stringValue);
+    if (resultString.GetError() != JsNoError)
+    {
+        fwprintf(stderr, _u("Failed to print REPL result.\n"));
+        return;
+    }
+
+    charcount_t resultLength = 0;
+    LPWSTR wideResult = resultString.GetWideString(&resultLength);
+    if (wideResult != nullptr)
+    {
+        wprintf(_u("%s\n"), wideResult);
+    }
+}
+
+HRESULT ProcessReplMessageQueue(MessageQueue* messageQueue)
+{
+    HRESULT hr = S_OK;
+
+    if (messageQueue == nullptr)
+    {
+        return hr;
+    }
+
+    do
+    {
+        IfFailGo(messageQueue->ProcessAll(REPL_SOURCE_NAME));
+    } while (!messageQueue->IsEmpty());
+
+Error:
+    return hr;
+}
+
+int FindFirstNonFlagArgumentIndex(int argc, _In_reads_(argc) LPWSTR argv[])
+{
+    for (int i = 1; i < argc; i++)
+    {
+        if (argv[i] == nullptr || argv[i][0] == _u('\0'))
+        {
+            continue;
+        }
+
+        if (argv[i][0] == _u('-')
+#ifdef _WIN32
+            || argv[i][0] == _u('/')
+#endif
+            )
+        {
+            continue;
+        }
+
+        return i;
+    }
+
+    return -1;
 }
 
 // On success the param byteCodeBuffer will be allocated in the function.
@@ -975,6 +1141,183 @@ HRESULT ExecuteTestWithMemoryCheck(char* fileName)
     return hr;
 }
 
+HRESULT ExecuteRepl()
+{
+    HRESULT hr = S_OK;
+    JsRuntimeHandle runtime = JS_INVALID_RUNTIME_HANDLE;
+    JsContextRef context = JS_INVALID_REFERENCE;
+    MessageQueue* messageQueue = nullptr;
+    JsValueRef sourceName = JS_INVALID_REFERENCE;
+    JsValueRef undefinedValue = JS_INVALID_REFERENCE;
+
+    if (doTTRecord || doTTReplay)
+    {
+        fwprintf(stderr, _u("REPL mode does not support -TTRecord/-TTReplay. Please provide a script file.\n"));
+        IfFailGo(E_FAIL);
+    }
+
+    IfFailGo(CreateRuntime(&runtime));
+    chRuntime = runtime;
+
+    if (HostConfigFlags::flags.DebugLaunch)
+    {
+        Debugger* debugger = Debugger::GetDebugger(runtime);
+        debugger->StartDebugging(runtime);
+    }
+
+    IfJsErrorFailLog(ChakraRTInterface::JsCreateContext(runtime, &context));
+    IfJsErrorFailLog(ChakraRTInterface::JsSetCurrentContext(context));
+
+#ifdef DEBUG
+    ChakraRTInterface::SetCheckOpHelpersFlag(true);
+#endif
+
+    if (!WScriptJsrt::Initialize())
+    {
+        IfFailGo(E_FAIL);
+    }
+
+    if (HostConfigFlags::flags.TrackRejectedPromises)
+    {
+        ChakraRTInterface::JsSetHostPromiseRejectionTracker(WScriptJsrt::PromiseRejectionTrackerCallback, nullptr);
+    }
+
+    messageQueue = new MessageQueue();
+    WScriptJsrt::AddMessageQueue(messageQueue);
+
+    IfJsErrorFailLog(ChakraRTInterface::JsSetPromiseContinuationCallback(WScriptJsrt::PromiseContinuationCallback, (void*)messageQueue));
+    IfJsErrorFailLog(ChakraRTInterface::JsCreateString(REPL_SOURCE_NAME, strlen(REPL_SOURCE_NAME), &sourceName));
+    IfJsErrorFailLog(ChakraRTInterface::JsGetUndefinedValue(&undefinedValue));
+
+    wprintf(_u("ChakraCore REPL (type .exit to quit)\n"));
+
+    while (true)
+    {
+        wprintf(_u("js> "));
+        fflush(stdout);
+
+        char* line = ReadReplLine();
+        if (line == nullptr)
+        {
+            wprintf(_u("\n"));
+            break;
+        }
+
+        if (IsReplExitCommand(line))
+        {
+            free(line);
+            break;
+        }
+
+        if (line[0] == '\0')
+        {
+            free(line);
+            continue;
+        }
+
+        JsValueRef scriptSource = JS_INVALID_REFERENCE;
+        JsValueRef result = JS_INVALID_REFERENCE;
+        JsErrorCode runScript = ChakraRTInterface::JsCreateString(line, strlen(line), &scriptSource);
+        free(line);
+
+        if (runScript != JsNoError)
+        {
+            fwprintf(stderr, _u("ERROR: failed to create REPL source. JsErrorCode=0x%x (%s)\n"), runScript, Helpers::JsErrorCodeToString(runScript));
+            continue;
+        }
+
+        runScript = ChakraRTInterface::JsRun(scriptSource,
+            WScriptJsrt::GetNextSourceContext(), sourceName,
+            JsParseScriptAttributeNone,
+            &result);
+
+        ChakraRTInterface::JsTTDNotifyYield();
+
+        if (runScript != JsNoError)
+        {
+            WScriptJsrt::PrintException(REPL_SOURCE_NAME, runScript);
+            continue;
+        }
+
+        if (result != undefinedValue)
+        {
+            PrintReplResult(result);
+        }
+
+        IfFailGo(ProcessReplMessageQueue(messageQueue));
+    }
+
+Error:
+    if (messageQueue != nullptr)
+    {
+        messageQueue->RemoveAll();
+        bool hasException;
+        if (ChakraRTInterface::JsHasException(&hasException) == JsNoError && hasException)
+        {
+            JsValueRef exception = JS_INVALID_REFERENCE;
+            ChakraRTInterface::JsGetAndClearException(&exception);
+        }
+        delete messageQueue;
+    }
+
+    WScriptJsrt::Uninitialize();
+
+    if (Debugger::debugger != nullptr)
+    {
+        Debugger::CloseDebugger();
+    }
+
+    ChakraRTInterface::JsSetCurrentContext(nullptr);
+
+    if (runtime != JS_INVALID_RUNTIME_HANDLE)
+    {
+        ChakraRTInterface::JsDisposeRuntime(runtime);
+    }
+
+    _flushall();
+
+    return hr;
+}
+
+HRESULT ExecuteReplWithMemoryCheck()
+{
+    HRESULT hr = E_FAIL;
+#ifdef _WIN32 // looks on linux it always leak ThreadContextTLSEntry since there's no DllMain
+#ifdef CHECK_MEMORY_LEAK
+    // Always check memory leak, unless user specified the flag already
+    if (!ChakraRTInterface::IsEnabledCheckMemoryFlag())
+    {
+        ChakraRTInterface::SetCheckMemoryLeakFlag(true);
+    }
+
+    // Disable the output in case an unhandled exception happens
+    // We will re-enable it if there is no unhandled exceptions
+    ChakraRTInterface::SetEnableCheckMemoryLeakOutput(false);
+#endif
+#endif
+
+#ifdef _WIN32
+    __try
+    {
+        hr = ExecuteRepl();
+    }
+    __except (HostExceptionFilter(GetExceptionCode(), GetExceptionInformation()))
+    {
+        Assert(false);
+    }
+#else
+    // REVIEW: Do we need a SEH handler here?
+    hr = ExecuteRepl();
+    if (FAILED(hr)) exit(0);
+#endif // _WIN32
+
+    _flushall();
+#ifdef CHECK_MEMORY_LEAK
+    ChakraRTInterface::SetEnableCheckMemoryLeakOutput(true);
+#endif
+    return hr;
+}
+
 #ifdef _WIN32
 bool HandleJITServerFlag(int& argc, _Inout_updates_to_(argc, argc) LPWSTR argv[])
 {
@@ -1060,7 +1403,12 @@ cleanup:
 unsigned int WINAPI StaticThreadProc(void *lpParam)
 {
     ChakraRTInterface::ArgInfo* argInfo = static_cast<ChakraRTInterface::ArgInfo* >(lpParam);
-    return ExecuteTestWithMemoryCheck(argInfo->filename);
+    if (argInfo->filename != nullptr)
+    {
+        return ExecuteTestWithMemoryCheck(argInfo->filename);
+    }
+
+    return ExecuteReplWithMemoryCheck();
 }
 
 #ifndef _WIN32
@@ -1106,14 +1454,6 @@ int _cdecl wmain(int argc, __in_ecount(argc) LPWSTR argv[])
 #ifdef _WIN32
     ATOM lock;
 #endif
-
-    if (argc < 2)
-    {
-        PrintUsage();
-        PAL_Shutdown();
-        retval = EXIT_FAILURE;
-        goto return_cleanup;
-    }
 
 #ifdef _WIN32
     if (runJITServer)
@@ -1233,7 +1573,11 @@ int _cdecl wmain(int argc, __in_ecount(argc) LPWSTR argv[])
 
     if (argInfo.filename == nullptr)
     {
-        WideStringToNarrowDynamic(argv[1], &argInfo.filename);
+        int fallbackFileNameIndex = FindFirstNonFlagArgumentIndex(argc, argv);
+        if (fallbackFileNameIndex > 0)
+        {
+            WideStringToNarrowDynamic(argv[fallbackFileNameIndex], &argInfo.filename);
+        }
     }
 
     if (success)
@@ -1271,7 +1615,14 @@ int _cdecl wmain(int argc, __in_ecount(argc) LPWSTR argv[])
         }
 #else
         // On linux, execute on the same thread
-        exitCode = ExecuteTestWithMemoryCheck(argInfo.filename);
+        if (argInfo.filename != nullptr)
+        {
+            exitCode = ExecuteTestWithMemoryCheck(argInfo.filename);
+        }
+        else
+        {
+            exitCode = ExecuteReplWithMemoryCheck();
+        }
 #endif
 
         ChakraRTInterface::UnloadChakraDll(chakraLibrary);
