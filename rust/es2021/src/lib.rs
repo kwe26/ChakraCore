@@ -1,7 +1,8 @@
 use serde::Serialize;
 use swc_common::{sync::Lrc, util::take::Take, FileName, SourceMap, DUMMY_SP};
-use swc_ecma_ast::{AssignExpr, AssignOp, BinExpr, BinaryOp, Expr, ParenExpr, Program};
-use swc_ecma_compat_es2021::es2021;
+use swc_ecma_ast::{
+    AssignExpr, AssignOp, AssignTarget, BinExpr, BinaryOp, Expr, ParenExpr, Program,
+};
 use swc_ecma_codegen::to_code;
 use swc_ecma_parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
@@ -75,37 +76,55 @@ pub fn analyze_source_to_json(source: &str) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|error| format!("failed to serialize report: {error}"))
 }
 
-struct LogicalAssignmentParenFixer;
+struct LogicalAssignmentLowerer;
 
-impl VisitMut for LogicalAssignmentParenFixer {
-    fn visit_mut_bin_expr(&mut self, node: &mut BinExpr) {
+impl VisitMut for LogicalAssignmentLowerer {
+    fn visit_mut_expr(&mut self, node: &mut Expr) {
         node.visit_mut_children_with(self);
 
-        let is_logical_operator = matches!(
-            node.op,
-            BinaryOp::LogicalOr | BinaryOp::LogicalAnd | BinaryOp::NullishCoalescing
-        );
+        let assign_expr = match node {
+            Expr::Assign(assign_expr) => assign_expr,
+            _ => return,
+        };
 
-        if !is_logical_operator {
-            return;
-        }
+        let binary_operator = match assign_expr.op {
+            AssignOp::AndAssign => BinaryOp::LogicalAnd,
+            AssignOp::OrAssign => BinaryOp::LogicalOr,
+            AssignOp::NullishAssign => BinaryOp::NullishCoalescing,
+            _ => return,
+        };
 
-        if !matches!(node.right.as_ref(), Expr::Assign(_)) {
-            return;
-        }
+        let left_simple = match assign_expr.left.clone() {
+            AssignTarget::Simple(simple) => simple,
+            AssignTarget::Pat(_) => return,
+        };
 
-        let right_expression = node.right.take();
-        node.right = Box::new(Expr::Paren(ParenExpr {
-            span: DUMMY_SP,
-            expr: right_expression,
-        }));
+        let left_expr: Box<Expr> = left_simple.clone().into();
+        let right_value = assign_expr.right.take();
+        let plain_assignment = Expr::Assign(AssignExpr {
+            span: assign_expr.span,
+            op: AssignOp::Assign,
+            left: AssignTarget::Simple(left_simple),
+            right: right_value,
+        });
+
+        let lowered = Expr::Bin(BinExpr {
+            span: assign_expr.span,
+            op: binary_operator,
+            left: left_expr,
+            right: Box::new(Expr::Paren(ParenExpr {
+                span: DUMMY_SP,
+                expr: Box::new(plain_assignment),
+            })),
+        });
+
+        *node = lowered;
     }
 }
 
 pub fn transform_source_for_runtime(source: &str) -> Result<String, String> {
     let mut program = parse_program(source)?;
-    program.mutate(es2021());
-    program.visit_mut_with(&mut LogicalAssignmentParenFixer);
+    program.visit_mut_with(&mut LogicalAssignmentLowerer);
 
     Ok(to_code(&program))
 }
