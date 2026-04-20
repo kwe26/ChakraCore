@@ -19,6 +19,15 @@
 #include <ctime>
 #include <ratio>
 #include <chrono>
+#include <algorithm>
+#include <cctype>
+#ifdef _WIN32
+#include <direct.h>
+#include <sys/stat.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #if defined(_X86_) || defined(_M_IX86)
 #define CPU_ARCH_TEXT "x86"
@@ -77,6 +86,417 @@ std::map<JsModuleRecord, std::string>  WScriptJsrt::moduleDirMap;
 std::map<JsModuleRecord, ModuleState>  WScriptJsrt::moduleErrMap;
 std::map<DWORD_PTR, std::string> WScriptJsrt::scriptDirMap;
 DWORD_PTR WScriptJsrt::sourceContext = 0;
+
+namespace
+{
+    std::map<std::string, JsValueRef> g_requireModuleCache;
+
+    bool IsPathSeparator(char ch)
+    {
+        return ch == '/' || ch == '\\';
+    }
+
+    bool IsAbsolutePath(const std::string& path)
+    {
+        if (path.empty())
+        {
+            return false;
+        }
+
+#ifdef _WIN32
+        if (path.length() >= 2 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':')
+        {
+            return true;
+        }
+
+        if (path.length() >= 2 && IsPathSeparator(path[0]) && IsPathSeparator(path[1]))
+        {
+            return true;
+        }
+#endif
+
+        return IsPathSeparator(path[0]);
+    }
+
+    bool EndsWithCaseInsensitive(const std::string& value, const std::string& suffix)
+    {
+        if (suffix.length() > value.length())
+        {
+            return false;
+        }
+
+        const size_t offset = value.length() - suffix.length();
+        for (size_t i = 0; i < suffix.length(); ++i)
+        {
+            const int left = std::tolower(static_cast<unsigned char>(value[offset + i]));
+            const int right = std::tolower(static_cast<unsigned char>(suffix[i]));
+            if (left != right)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool HasExtension(const std::string& path)
+    {
+        const size_t separator = path.find_last_of("/\\");
+        const size_t dot = path.find_last_of('.');
+        return dot != std::string::npos && (separator == std::string::npos || dot > separator);
+    }
+
+    std::string JoinPaths(const std::string& left, const std::string& right)
+    {
+        if (left.empty())
+        {
+            return right;
+        }
+
+        if (right.empty())
+        {
+            return left;
+        }
+
+        if (IsPathSeparator(right[0]))
+        {
+            return right;
+        }
+
+        if (IsPathSeparator(left[left.length() - 1]))
+        {
+            return left + right;
+        }
+
+        return left + "/" + right;
+    }
+
+    std::string NormalizeRequireSpecifier(std::string specifier)
+    {
+        const std::string commaJsonSuffix = ",json";
+        if (EndsWithCaseInsensitive(specifier, commaJsonSuffix))
+        {
+            specifier = specifier.substr(0, specifier.length() - commaJsonSuffix.length()) + ".json";
+        }
+
+        return specifier;
+    }
+
+    std::string GetCurrentWorkingDirectoryString()
+    {
+        char cwd[_MAX_PATH];
+#ifdef _WIN32
+        if (_getcwd(cwd, _countof(cwd)) != nullptr)
+#else
+        if (getcwd(cwd, sizeof(cwd)) != nullptr)
+#endif
+        {
+            return std::string(cwd);
+        }
+
+        return std::string();
+    }
+
+    bool IsRegularFile(const char* path)
+    {
+#ifdef _WIN32
+        struct _stat fileInfo;
+        if (_stat(path, &fileInfo) != 0)
+        {
+            return false;
+        }
+
+        return (fileInfo.st_mode & _S_IFREG) != 0;
+#else
+        struct stat fileInfo;
+        if (stat(path, &fileInfo) != 0)
+        {
+            return false;
+        }
+
+        return S_ISREG(fileInfo.st_mode);
+#endif
+    }
+
+    bool TryResolveRequirePath(const std::string& rawSpecifier, const char* baseDirectory, std::string* resolvedFullPath)
+    {
+        if (resolvedFullPath == nullptr)
+        {
+            return false;
+        }
+
+        const std::string specifier = NormalizeRequireSpecifier(rawSpecifier);
+
+        std::string effectiveBaseDirectory = baseDirectory == nullptr ? std::string() : std::string(baseDirectory);
+        if (effectiveBaseDirectory.empty())
+        {
+            effectiveBaseDirectory = GetCurrentWorkingDirectoryString();
+        }
+
+        std::string inputPath = IsAbsolutePath(specifier) ? specifier : JoinPaths(effectiveBaseDirectory, specifier);
+
+        std::vector<std::string> candidates;
+        candidates.push_back(inputPath);
+
+        if (!HasExtension(inputPath))
+        {
+            candidates.push_back(inputPath + ".js");
+            candidates.push_back(inputPath + ".json");
+            candidates.push_back(JoinPaths(inputPath, "index.js"));
+            candidates.push_back(JoinPaths(inputPath, "index.json"));
+        }
+
+        for (const std::string& candidate : candidates)
+        {
+            char fullPath[_MAX_PATH];
+            if (_fullpath(fullPath, candidate.c_str(), _MAX_PATH) == nullptr)
+            {
+                continue;
+            }
+
+            if (!IsRegularFile(fullPath))
+            {
+                continue;
+            }
+
+            *resolvedFullPath = std::string(fullPath);
+            return true;
+        }
+
+        return false;
+    }
+
+    std::string GetDirectoryFromFullPath(const std::string& fullPath)
+    {
+        char fileDrive[_MAX_DRIVE];
+        char fileDir[_MAX_DIR];
+
+        if (_splitpath_s(fullPath.c_str(), fileDrive, _countof(fileDrive), fileDir, _countof(fileDir), nullptr, 0, nullptr, 0) == 0)
+        {
+            std::string result = fileDrive;
+            result += fileDir;
+            return result;
+        }
+
+        const size_t separator = fullPath.find_last_of("/\\");
+        return separator == std::string::npos ? std::string() : fullPath.substr(0, separator + 1);
+    }
+
+    JsErrorCode LoadTextFile(const std::string& fullPath, std::string* text)
+    {
+        if (text == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        LPCSTR fileContents = nullptr;
+        UINT fileLength = 0;
+        std::string resolvedPath = fullPath;
+        HRESULT hr = Helpers::LoadScriptFromFile(fullPath.c_str(), fileContents, &fileLength, &resolvedPath, true);
+        if (FAILED(hr) || fileContents == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        text->assign(fileContents, fileLength);
+        WScriptJsrt::FinalizeFree((void*)fileContents);
+        return JsNoError;
+    }
+
+    bool IsJsonPath(const std::string& fullPath)
+    {
+        return EndsWithCaseInsensitive(fullPath, ".json");
+    }
+
+    JsErrorCode RequireJsonModule(const std::string& fullPath, JsValueRef* resultValue)
+    {
+        std::string jsonText;
+        JsErrorCode errorCode = LoadTextFile(fullPath, &jsonText);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef jsonTextValue = JS_INVALID_REFERENCE;
+        JsValueRef globalObject = JS_INVALID_REFERENCE;
+        JsValueRef jsonObject = JS_INVALID_REFERENCE;
+        JsValueRef parseFunction = JS_INVALID_REFERENCE;
+        JsPropertyIdRef jsonProperty = JS_INVALID_REFERENCE;
+        JsPropertyIdRef parseProperty = JS_INVALID_REFERENCE;
+
+        errorCode = ChakraRTInterface::JsCreateString(jsonText.c_str(), jsonText.length(), &jsonTextValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsGetGlobalObject(&globalObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = CreatePropertyIdFromString("JSON", &jsonProperty);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsGetProperty(globalObject, jsonProperty, &jsonObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = CreatePropertyIdFromString("parse", &parseProperty);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsGetProperty(jsonObject, parseProperty, &parseFunction);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef parseArgs[2] = { jsonObject, jsonTextValue };
+        return ChakraRTInterface::JsCallFunction(parseFunction, parseArgs, _countof(parseArgs), resultValue);
+    }
+
+    JsErrorCode RequireJavaScriptModule(const std::string& fullPath, JsValueRef* resultValue)
+    {
+        std::string scriptBody;
+        JsErrorCode errorCode = LoadTextFile(fullPath, &scriptBody);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        const std::string moduleDirectory = GetDirectoryFromFullPath(fullPath);
+        const std::string wrappedScript =
+            std::string("(function (exports, module, globalRequire, __filename, __dirname) {\n") +
+            "function require(specifier) { return globalRequire(specifier, __dirname); }\n" +
+            scriptBody +
+            "\n})";
+
+        JsValueRef moduleObject = JS_INVALID_REFERENCE;
+        JsValueRef exportsObject = JS_INVALID_REFERENCE;
+        JsValueRef globalObject = JS_INVALID_REFERENCE;
+        JsValueRef globalRequireFunction = JS_INVALID_REFERENCE;
+        JsValueRef wrappedScriptValue = JS_INVALID_REFERENCE;
+        JsValueRef fileNameValue = JS_INVALID_REFERENCE;
+        JsValueRef directoryValue = JS_INVALID_REFERENCE;
+        JsValueRef factoryFunction = JS_INVALID_REFERENCE;
+        JsValueRef undefinedValue = JS_INVALID_REFERENCE;
+        JsValueRef ignoredResult = JS_INVALID_REFERENCE;
+        JsPropertyIdRef exportsProperty = JS_INVALID_REFERENCE;
+        JsPropertyIdRef requireProperty = JS_INVALID_REFERENCE;
+
+        errorCode = ChakraRTInterface::JsCreateObject(&moduleObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsCreateObject(&exportsObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = CreatePropertyIdFromString("exports", &exportsProperty);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsSetProperty(moduleObject, exportsProperty, exportsObject, true);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsGetGlobalObject(&globalObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = CreatePropertyIdFromString("require", &requireProperty);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsGetProperty(globalObject, requireProperty, &globalRequireFunction);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsCreateString(wrappedScript.c_str(), wrappedScript.length(), &wrappedScriptValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsCreateString(fullPath.c_str(), fullPath.length(), &fileNameValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsCreateString(moduleDirectory.c_str(), moduleDirectory.length(), &directoryValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        const DWORD_PTR sourceContext = WScriptJsrt::GetNextSourceContext();
+        WScriptJsrt::RegisterScriptDir(sourceContext, fullPath.c_str());
+
+        errorCode = ChakraRTInterface::JsRun(wrappedScriptValue, sourceContext, fileNameValue, JsParseScriptAttributeNone, &factoryFunction);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = ChakraRTInterface::JsGetUndefinedValue(&undefinedValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef invokeArgs[6] =
+        {
+            undefinedValue,
+            exportsObject,
+            moduleObject,
+            globalRequireFunction,
+            fileNameValue,
+            directoryValue
+        };
+
+        errorCode = ChakraRTInterface::JsCallFunction(factoryFunction, invokeArgs, _countof(invokeArgs), &ignoredResult);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        return ChakraRTInterface::JsGetProperty(moduleObject, exportsProperty, resultValue);
+    }
+
+    void ClearRequireCaches()
+    {
+        for (auto iterator = g_requireModuleCache.begin(); iterator != g_requireModuleCache.end(); ++iterator)
+        {
+            ChakraRTInterface::JsRelease(iterator->second, nullptr);
+        }
+
+        g_requireModuleCache.clear();
+    }
+}
 
 #define ERROR_MESSAGE_TO_STRING(errorCode, errorMessage, errorMessageString)        \
     JsErrorCode errorCode = JsNoError;                                              \
@@ -561,6 +981,10 @@ JsValueRef __stdcall WScriptJsrt::RequireCallback(JsValueRef callee, bool isCons
     LPCWSTR errorMessage = _u("");
     JsValueRef returnValue = JS_INVALID_REFERENCE;
     AutoString moduleName;
+    AutoString baseDirectory;
+    const char* effectiveBaseDirectory = nullptr;
+    std::string inferredBaseDirectory;
+    std::string resolvedFullPath;
 
     if (argumentCount < 2)
     {
@@ -571,29 +995,388 @@ JsValueRef __stdcall WScriptJsrt::RequireCallback(JsValueRef callee, bool isCons
 
     IfJsrtErrorSetGo(moduleName.Initialize(arguments[1]));
 
-    if (strcmp(moduleName.GetString(), "chakra:info") == 0)
+    if (strncmp(moduleName.GetString(), "chakra:", strlen("chakra:")) == 0)
     {
-        IfJsrtErrorSetGo(ChakraRTInterface::JsCreateObject(&returnValue));
-
-        if (!InstallObjectsOnObject(returnValue, "version", InfoVersionCallback))
+        if (strcmp(moduleName.GetString(), "chakra:info") == 0)
         {
-            errorCode = JsErrorFatal;
-            errorMessage = _u("Failed to initialize module exports for chakra:info.");
-            goto Error;
+            IfJsrtErrorSetGo(ChakraRTInterface::JsCreateObject(&returnValue));
+
+            if (!InstallObjectsOnObject(returnValue, "version", InfoVersionCallback))
+            {
+                errorCode = JsErrorFatal;
+                errorMessage = _u("Failed to initialize module exports for chakra:info.");
+                goto Error;
+            }
+
+            return returnValue;
         }
 
-        return returnValue;
-    }
+        if (strcmp(moduleName.GetString(), "chakra:fs") == 0)
+        {
+            IfJsrtErrorSetGo(ChakraRTInterface::JsCreateObject(&returnValue));
 
-    if (strncmp(moduleName.GetString(), "chakra:", strlen("chakra:")) != 0)
-    {
+            if (!InstallObjectsOnObject(returnValue, "readFileSync", FsReadFileSyncCallback) ||
+                !InstallObjectsOnObject(returnValue, "writeFileSync", FsWriteFileSyncCallback) ||
+                !InstallObjectsOnObject(returnValue, "existsSync", FsExistsSyncCallback))
+            {
+                errorCode = JsErrorFatal;
+                errorMessage = _u("Failed to initialize module exports for chakra:fs.");
+                goto Error;
+            }
+
+            return returnValue;
+        }
+
+        if (strcmp(moduleName.GetString(), "chakra:reqwest") == 0)
+        {
+            IfJsrtErrorSetGo(ChakraRTInterface::JsCreateObject(&returnValue));
+
+            if (!InstallObjectsOnObject(returnValue, "get", ReqwestGetCallback) ||
+                !InstallObjectsOnObject(returnValue, "post", ReqwestPostCallback) ||
+                !InstallObjectsOnObject(returnValue, "fetch", ReqwestFetchCallback) ||
+                !InstallObjectsOnObject(returnValue, "downloadFetch", ReqwestDownloadFetchCallback))
+            {
+                errorCode = JsErrorFatal;
+                errorMessage = _u("Failed to initialize module exports for chakra:reqwest.");
+                goto Error;
+            }
+
+            return returnValue;
+        }
+
         errorCode = JsErrorInvalidArgument;
-        errorMessage = _u("Only system packages are supported. Use names in the form chakra:<name>.");
+        errorMessage = _u("Unknown system package. Available modules: chakra:info, chakra:fs, chakra:reqwest.");
         goto Error;
     }
 
-    errorCode = JsErrorInvalidArgument;
-    errorMessage = _u("Unknown system package. Available modules: chakra:info.");
+    if (argumentCount > 2)
+    {
+        IfJsrtErrorSetGo(baseDirectory.Initialize(arguments[2]));
+        effectiveBaseDirectory = baseDirectory.GetString();
+    }
+    else if (!scriptDirMap.empty())
+    {
+        inferredBaseDirectory = scriptDirMap.rbegin()->second;
+        effectiveBaseDirectory = inferredBaseDirectory.c_str();
+    }
+
+    if (!TryResolveRequirePath(moduleName.GetString(), effectiveBaseDirectory, &resolvedFullPath))
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("Cannot resolve required module path.");
+        goto Error;
+    }
+
+    {
+        auto cached = g_requireModuleCache.find(resolvedFullPath);
+        if (cached != g_requireModuleCache.end())
+        {
+            return cached->second;
+        }
+    }
+
+    if (IsJsonPath(resolvedFullPath))
+    {
+        errorCode = RequireJsonModule(resolvedFullPath, &returnValue);
+    }
+    else
+    {
+        errorCode = RequireJavaScriptModule(resolvedFullPath, &returnValue);
+    }
+
+    if (errorCode != JsNoError)
+    {
+        errorMessage = _u("Failed to load module through require().");
+        goto Error;
+    }
+
+    errorCode = ChakraRTInterface::JsAddRef(returnValue, nullptr);
+    if (errorCode != JsNoError)
+    {
+        errorMessage = _u("Failed to cache required module exports.");
+        goto Error;
+    }
+
+    g_requireModuleCache[resolvedFullPath] = returnValue;
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::FsReadFileSyncCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString path;
+    std::string contents;
+    std::string rustError;
+
+    if (argumentCount < 2)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:fs.readFileSync expects a path argument.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(path.Initialize(arguments[1]));
+
+    if (!RustPackageBridge::TryFsReadFileUtf8(path.GetString(), &contents, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:fs.readFileSync failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ChakraRTInterface::JsCreateString(contents.c_str(), contents.length(), &returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::FsWriteFileSyncCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString path;
+    AutoString content;
+    std::string rustError;
+
+    if (argumentCount < 3)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:fs.writeFileSync expects path and content arguments.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(path.Initialize(arguments[1]));
+    IfJsrtErrorSetGo(content.Initialize(arguments[2]));
+
+    if (!RustPackageBridge::TryFsWriteFileUtf8(path.GetString(), content.GetString(), &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:fs.writeFileSync failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ChakraRTInterface::JsGetUndefinedValue(&returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::FsExistsSyncCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString path;
+    std::string rustError;
+    bool exists = false;
+
+    if (argumentCount < 2)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:fs.existsSync expects a path argument.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(path.Initialize(arguments[1]));
+
+    if (!RustPackageBridge::TryFsExists(path.GetString(), &exists, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:fs.existsSync failed.");
+        goto Error;
+    }
+
+    if (exists)
+    {
+        IfJsrtErrorSetGo(ChakraRTInterface::JsGetTrueValue(&returnValue));
+    }
+    else
+    {
+        IfJsrtErrorSetGo(ChakraRTInterface::JsGetFalseValue(&returnValue));
+    }
+
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::ReqwestGetCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString url;
+    std::string responseText;
+    std::string rustError;
+
+    if (argumentCount < 2)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:reqwest.get expects a URL argument.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(url.Initialize(arguments[1]));
+
+    if (!RustPackageBridge::TryReqwestGetText(url.GetString(), &responseText, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:reqwest.get failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ChakraRTInterface::JsCreateString(responseText.c_str(), responseText.length(), &returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::ReqwestPostCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString url;
+    AutoString body;
+    std::string responseText;
+    std::string rustError;
+
+    if (argumentCount < 3)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:reqwest.post expects URL and body arguments.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(url.Initialize(arguments[1]));
+    IfJsrtErrorSetGo(body.Initialize(arguments[2]));
+
+    if (!RustPackageBridge::TryReqwestPostText(url.GetString(), body.GetString(), &responseText, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:reqwest.post failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ChakraRTInterface::JsCreateString(responseText.c_str(), responseText.length(), &returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::ReqwestFetchCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString method;
+    AutoString url;
+    AutoString body;
+    std::string bodyText;
+    const std::string* bodyPointer = nullptr;
+    std::string responseText;
+    std::string rustError;
+
+    if (argumentCount < 3)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:reqwest.fetch expects method and URL arguments.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(method.Initialize(arguments[1]));
+    IfJsrtErrorSetGo(url.Initialize(arguments[2]));
+
+    if (argumentCount > 3)
+    {
+        JsValueType bodyType = JsUndefined;
+        IfJsrtErrorSetGo(ChakraRTInterface::JsGetValueType(arguments[3], &bodyType));
+        if (bodyType != JsUndefined)
+        {
+            IfJsrtErrorSetGo(body.Initialize(arguments[3]));
+            bodyText = body.GetString();
+            bodyPointer = &bodyText;
+        }
+    }
+
+    if (!RustPackageBridge::TryReqwestFetchText(method.GetString(), url.GetString(), bodyPointer, &responseText, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:reqwest.fetch failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ChakraRTInterface::JsCreateString(responseText.c_str(), responseText.length(), &returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::ReqwestDownloadFetchCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString url;
+    AutoString outputPath;
+    std::string rustError;
+    int parallelPartCount = 4;
+
+    if (argumentCount < 3)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:reqwest.downloadFetch expects URL and outputPath arguments.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(url.Initialize(arguments[1]));
+    IfJsrtErrorSetGo(outputPath.Initialize(arguments[2]));
+
+    if (argumentCount > 3)
+    {
+        IfJsrtErrorSetGo(ChakraRTInterface::JsNumberToInt(arguments[3], &parallelPartCount));
+    }
+
+    if (parallelPartCount <= 0)
+    {
+        parallelPartCount = 4;
+    }
+
+    if (!RustPackageBridge::TryReqwestDownloadFetchParallel(url.GetString(), outputPath.GetString(), parallelPartCount, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:reqwest.downloadFetch failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ChakraRTInterface::JsGetTrueValue(&returnValue));
+    return returnValue;
 
 Error:
     SetExceptionIf(errorCode, errorMessage);
@@ -611,7 +1394,7 @@ JsValueRef __stdcall WScriptJsrt::InfoVersionCallback(JsValueRef callee, bool is
     if (!RustPackageBridge::TryGetInfoVersion(&version))
     {
         errorCode = JsErrorFatal;
-        errorMessage = _u("Rust package runtime for chakra:info was not found. Build bin/ch/rust/chakra_packages and set CHAKRA_RUST_PACKAGES_PATH or copy the library next to ch.exe.");
+        errorMessage = _u("Rust package runtime for chakra:info was not found. Build rust/chakra_packages and set CHAKRA_RUST_PACKAGES_PATH or copy the library next to ch.exe.");
         goto Error;
     }
 
@@ -1325,6 +2108,8 @@ Error:
 
 bool WScriptJsrt::Uninitialize()
 {
+    ClearRequireCaches();
+
     // moduleRecordMap is a global std::map, its destructor may access overridden
     // "operator delete" / global HeapAllocator::Instance. Clear it manually here
     // to avoid worrying about global destructor order.

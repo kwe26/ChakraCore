@@ -91,6 +91,41 @@ PRINT_USAGE() {
     echo ""
 }
 
+BUILD_RUST_PACKAGES() {
+    local RUST_PACKAGES_DIR="$CHAKRACORE_DIR/rust/chakra_packages"
+    if [[ ! -d "$RUST_PACKAGES_DIR" ]]; then
+        local LEGACY_RUST_PACKAGES_DIR="$CHAKRACORE_DIR/bin/ch/rust/chakra_packages"
+        if [[ -d "$LEGACY_RUST_PACKAGES_DIR" ]]; then
+            RUST_PACKAGES_DIR="$LEGACY_RUST_PACKAGES_DIR"
+        fi
+    fi
+
+    if [[ ! -d "$RUST_PACKAGES_DIR" ]]; then
+        echo "Rust package directory not found at '$RUST_PACKAGES_DIR'. Skipping Rust package build."
+        return
+    fi
+
+    local CARGO_PATH=$(which cargo 2> /dev/null)
+    if [[ -z "$CARGO_PATH" || ! -x "$CARGO_PATH" ]]; then
+        echo "ERROR: cargo not found. Install Rust toolchain to build Rust-backed require() packages."
+        exit 1
+    fi
+
+    echo "Building Rust package crate at $RUST_PACKAGES_DIR"
+    pushd "$RUST_PACKAGES_DIR" > /dev/null
+    $CARGO_PATH build --release
+    local RUST_RET=$?
+    popd > /dev/null
+
+    if [[ $RUST_RET != 0 ]]; then
+        echo "ERROR: Rust package build failed with exit code $RUST_RET"
+        exit $RUST_RET
+    fi
+
+    export CHAKRA_RUST_PACKAGES_PATH="$RUST_PACKAGES_DIR/target/release"
+    echo "CHAKRA_RUST_PACKAGES_PATH=$CHAKRA_RUST_PACKAGES_PATH"
+}
+
 pushd `dirname $0` > /dev/null
 CHAKRACORE_DIR=`pwd -P`
 popd > /dev/null
@@ -612,6 +647,12 @@ fi
 if [ ! -d "$BUILD_DIRECTORY" ]; then
     SAFE_RUN `mkdir -p $BUILD_DIRECTORY`
 fi
+
+# Rust-backed host packages must be built before building ch so runtime require("chakra:...") is ready.
+if [[ ! $TARGET_OS =~ "CC_TARGET_OS_ANDROID_SH=1" ]]; then
+    BUILD_RUST_PACKAGES
+fi
+
 pushd $BUILD_DIRECTORY > /dev/null
 
 if [[ $ARCH =~ "x86" ]]; then

@@ -98,7 +98,14 @@ function Resolve-MsBuildPath {
 }
 
 function Invoke-RustPackageBuild {
-    $rustProjectPath = Join-Path $RepoRoot "bin\ch\rust\chakra_packages"
+    $rustProjectPath = Join-Path $RepoRoot "rust\chakra_packages"
+    if (-not (Test-Path -Path (Join-Path $rustProjectPath "Cargo.toml"))) {
+        $legacyRustProjectPath = Join-Path $RepoRoot "bin\ch\rust\chakra_packages"
+        if (Test-Path -Path (Join-Path $legacyRustProjectPath "Cargo.toml")) {
+            $rustProjectPath = $legacyRustProjectPath
+        }
+    }
+
     $cargoTomlPath = Join-Path $rustProjectPath "Cargo.toml"
 
     if (-not (Test-Path -Path $cargoTomlPath)) {
