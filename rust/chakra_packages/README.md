@@ -28,12 +28,21 @@ Export currently available:
 - `chakra_reqwest_post_text` used by `require("chakra:reqwest").post(url, body)`
 - `chakra_reqwest_fetch_text` used by `require("chakra:reqwest").fetch(method, url, body?)`
 - `chakra_reqwest_download_fetch_parallel` used by `require("chakra:reqwest").downloadFetch(url, outputPath, parallelParts?)`
+- `chakra_es2020_analyze` used by `require("chakra:es2020").analyze(source)`
+- `chakra_es2021_analyze` used by `require("chakra:es2021").analyze(source)`
+- `chakra_es2021_transform` used by host runtime fallback for ES2021 logical assignment syntax
 
 ## Source layout
 
 The crate is split by module under `src/`:
 
 - `src/common/` shared FFI and error helpers
+- `src/es/` FFI exports for ES feature analyzers
 - `src/info/` implementation for `chakra:info`
 - `src/fs/` implementation for `chakra:fs`
 - `src/reqwest/` implementation for `chakra:reqwest`
+
+Versioned parser implementations live outside this crate:
+
+- `../es2020/` ES2020 syntax feature analysis with SWC
+- `../es2021/` ES2021 syntax feature analysis with SWC

@@ -39,6 +39,7 @@ namespace
     typedef char* (__cdecl *ChakraReqwestPostTextFn)(const char*, const char*);
     typedef char* (__cdecl *ChakraReqwestFetchTextFn)(const char*, const char*, const char*);
     typedef int (__cdecl *ChakraReqwestDownloadFetchParallelFn)(const char*, const char*, int);
+    typedef char* (__cdecl *ChakraEsAnalyzeFn)(const char*);
 #else
     typedef const char* (*ChakraInfoVersionFn)();
     typedef const char* (*ChakraLastErrorFn)();
@@ -50,6 +51,7 @@ namespace
     typedef char* (*ChakraReqwestPostTextFn)(const char*, const char*);
     typedef char* (*ChakraReqwestFetchTextFn)(const char*, const char*, const char*);
     typedef int (*ChakraReqwestDownloadFetchParallelFn)(const char*, const char*, int);
+    typedef char* (*ChakraEsAnalyzeFn)(const char*);
 #endif
 
     struct RustPackageApi
@@ -66,11 +68,17 @@ namespace
         ChakraReqwestPostTextFn reqwestPostText;
         ChakraReqwestFetchTextFn reqwestFetchText;
         ChakraReqwestDownloadFetchParallelFn reqwestDownloadFetchParallel;
+        ChakraEsAnalyzeFn es2020Analyze;
+        ChakraEsAnalyzeFn es2021Analyze;
+        ChakraEsAnalyzeFn es2021Transform;
     };
 
     RustPackageApi g_rustPackageApi =
     {
         false,
+        nullptr,
+        nullptr,
+        nullptr,
         nullptr,
         nullptr,
         nullptr,
@@ -263,6 +271,12 @@ namespace
             TryResolveSymbol(g_rustPackageApi.library, "chakra_reqwest_fetch_text"));
         g_rustPackageApi.reqwestDownloadFetchParallel = reinterpret_cast<ChakraReqwestDownloadFetchParallelFn>(
             TryResolveSymbol(g_rustPackageApi.library, "chakra_reqwest_download_fetch_parallel"));
+        g_rustPackageApi.es2020Analyze = reinterpret_cast<ChakraEsAnalyzeFn>(
+            TryResolveSymbol(g_rustPackageApi.library, "chakra_es2020_analyze"));
+        g_rustPackageApi.es2021Analyze = reinterpret_cast<ChakraEsAnalyzeFn>(
+            TryResolveSymbol(g_rustPackageApi.library, "chakra_es2021_analyze"));
+        g_rustPackageApi.es2021Transform = reinterpret_cast<ChakraEsAnalyzeFn>(
+            TryResolveSymbol(g_rustPackageApi.library, "chakra_es2021_transform"));
     }
 
     bool SetErrorMessage(std::string* errorMessage, const char* fallbackMessage)
@@ -523,4 +537,97 @@ bool RustPackageBridge::TryReqwestDownloadFetchParallel(const std::string& url, 
 
     SetErrorMessage(errorMessage, "HTTP download request failed through chakra:reqwest.downloadFetch.");
     return false;
+}
+
+bool RustPackageBridge::TryEs2020Analyze(const std::string& source, std::string* analysisJson, std::string* errorMessage)
+{
+    if (analysisJson == nullptr)
+    {
+        return false;
+    }
+
+    InitializeRustPackageApi();
+
+    if (g_rustPackageApi.es2020Analyze == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Rust symbol chakra_es2020_analyze is unavailable.");
+        return false;
+    }
+
+    if (g_rustPackageApi.stringFree == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Rust symbol chakra_string_free is unavailable.");
+        return false;
+    }
+
+    char* rawAnalysis = g_rustPackageApi.es2020Analyze(source.c_str());
+    if (rawAnalysis == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Failed to analyze source through chakra:es2020.");
+        return false;
+    }
+
+    return CopyOwnedRustString(rawAnalysis, analysisJson);
+}
+
+bool RustPackageBridge::TryEs2021Analyze(const std::string& source, std::string* analysisJson, std::string* errorMessage)
+{
+    if (analysisJson == nullptr)
+    {
+        return false;
+    }
+
+    InitializeRustPackageApi();
+
+    if (g_rustPackageApi.es2021Analyze == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Rust symbol chakra_es2021_analyze is unavailable.");
+        return false;
+    }
+
+    if (g_rustPackageApi.stringFree == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Rust symbol chakra_string_free is unavailable.");
+        return false;
+    }
+
+    char* rawAnalysis = g_rustPackageApi.es2021Analyze(source.c_str());
+    if (rawAnalysis == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Failed to analyze source through chakra:es2021.");
+        return false;
+    }
+
+    return CopyOwnedRustString(rawAnalysis, analysisJson);
+}
+
+bool RustPackageBridge::TryEs2021Transform(const std::string& source, std::string* transformedSource, std::string* errorMessage)
+{
+    if (transformedSource == nullptr)
+    {
+        return false;
+    }
+
+    InitializeRustPackageApi();
+
+    if (g_rustPackageApi.es2021Transform == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Rust symbol chakra_es2021_transform is unavailable.");
+        return false;
+    }
+
+    if (g_rustPackageApi.stringFree == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Rust symbol chakra_string_free is unavailable.");
+        return false;
+    }
+
+    char* rawTransformedSource = g_rustPackageApi.es2021Transform(source.c_str());
+    if (rawTransformedSource == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Failed to transform source through chakra:es2021.");
+        return false;
+    }
+
+    return CopyOwnedRustString(rawTransformedSource, transformedSource);
 }

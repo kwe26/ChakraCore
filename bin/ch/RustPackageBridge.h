@@ -16,4 +16,7 @@ namespace RustPackageBridge
     bool TryReqwestPostText(const std::string& url, const std::string& body, std::string* responseText, std::string* errorMessage = nullptr);
     bool TryReqwestFetchText(const std::string& method, const std::string& url, const std::string* body, std::string* responseText, std::string* errorMessage = nullptr);
     bool TryReqwestDownloadFetchParallel(const std::string& url, const std::string& outputPath, int parallelPartCount, std::string* errorMessage = nullptr);
+    bool TryEs2020Analyze(const std::string& source, std::string* analysisJson, std::string* errorMessage = nullptr);
+    bool TryEs2021Analyze(const std::string& source, std::string* analysisJson, std::string* errorMessage = nullptr);
+    bool TryEs2021Transform(const std::string& source, std::string* transformedSource, std::string* errorMessage = nullptr);
 }

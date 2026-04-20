@@ -8,4 +8,6 @@ name = "chakra_packages"
 crate-type = ["cdylib"]
 
 [dependencies]
+chakra_es2020 = { path = "../es2020" }
+chakra_es2021 = { path = "../es2021" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "gzip", "brotli", "deflate", "http2", "charset"] }

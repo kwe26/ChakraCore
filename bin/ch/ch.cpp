@@ -5,6 +5,7 @@
 //-------------------------------------------------------------------------------------------------------
 #include "stdafx.h"
 #include "Core/AtomLockGuids.h"
+#include "RustPackageBridge.h"
 #ifdef _WIN32
 #include <winver.h>
 #include <process.h>
@@ -178,6 +179,18 @@ const char* REPL_SOURCE_NAME = "repl";
 bool IsWhitespaceChar(char ch)
 {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
+}
+
+bool ShouldTryEs2021Transform(const char* sourceText)
+{
+    if (sourceText == nullptr)
+    {
+        return false;
+    }
+
+    return strstr(sourceText, "&&=") != nullptr ||
+        strstr(sourceText, "||=") != nullptr ||
+        strstr(sourceText, "??=") != nullptr;
 }
 
 bool IsReplExitCommand(const char* line)
@@ -591,10 +604,34 @@ HRESULT RunScript(const char* fileName, LPCSTR fileContents, size_t fileLength, 
         }
         else // bufferValue == nullptr && parserStateCache == nullptr
         {
+            std::string transformedScriptSource;
+            LPCSTR runtimeScriptSource = fileContents;
+            size_t runtimeScriptLength = fileLength;
+            bool usedTransformedScriptSource = false;
+
+            if (ShouldTryEs2021Transform(fileContents))
+            {
+                std::string transformError;
+                if (RustPackageBridge::TryEs2021Transform(fileContents, &transformedScriptSource, &transformError) && !transformedScriptSource.empty())
+                {
+                    runtimeScriptSource = transformedScriptSource.c_str();
+                    runtimeScriptLength = transformedScriptSource.length();
+                    usedTransformedScriptSource = true;
+                }
+            }
+
             JsValueRef scriptSource;
-            IfJsErrorFailLog(ChakraRTInterface::JsCreateExternalArrayBuffer((void*)fileContents,
-                (unsigned int)fileLength,
-                fileContentsFinalizeCallback, (void*)fileContents, &scriptSource));
+            if (usedTransformedScriptSource)
+            {
+                IfJsErrorFailLog(ChakraRTInterface::JsCreateString(runtimeScriptSource,
+                    runtimeScriptLength, &scriptSource));
+            }
+            else
+            {
+                IfJsErrorFailLog(ChakraRTInterface::JsCreateExternalArrayBuffer((void*)fileContents,
+                    (unsigned int)fileLength,
+                    fileContentsFinalizeCallback, (void*)fileContents, &scriptSource));
+            }
 
 #if ENABLE_TTD
             if (doTTRecord)
@@ -628,6 +665,12 @@ HRESULT RunScript(const char* fileName, LPCSTR fileContents, size_t fileLength, 
                 JsParseScriptAttributeNone,
                 nullptr /*result*/);
 #endif
+
+            if (usedTransformedScriptSource && fileContentsFinalizeCallback != nullptr && fileContents != nullptr)
+            {
+                fileContentsFinalizeCallback((void*)fileContents);
+                fileContents = nullptr;
+            }
         }
 
         //Do a yield after the main script body executes
@@ -657,9 +700,10 @@ HRESULT RunScript(const char* fileName, LPCSTR fileContents, size_t fileLength, 
     if(false)
     {
 ErrorRunFinalize:
-        if(fileContentsFinalizeCallback != nullptr)
+        if(fileContentsFinalizeCallback != nullptr && fileContents != nullptr)
         {
             fileContentsFinalizeCallback((void*)fileContents);
+            fileContents = nullptr;
         }
     }
 Error:

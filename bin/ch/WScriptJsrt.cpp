@@ -182,6 +182,34 @@ namespace
         return specifier;
     }
 
+    bool ShouldTryEs2021Transform(const std::string& sourceText)
+    {
+        return sourceText.find("&&=") != std::string::npos ||
+            sourceText.find("||=") != std::string::npos ||
+            sourceText.find("??=") != std::string::npos;
+    }
+
+    bool TryTransformEs2021Source(const std::string& sourceText, std::string* transformedText)
+    {
+        if (transformedText == nullptr)
+        {
+            return false;
+        }
+
+        if (!ShouldTryEs2021Transform(sourceText))
+        {
+            return false;
+        }
+
+        std::string rustError;
+        if (!RustPackageBridge::TryEs2021Transform(sourceText, transformedText, &rustError))
+        {
+            return false;
+        }
+
+        return !transformedText->empty();
+    }
+
     std::string GetCurrentWorkingDirectoryString()
     {
         char cwd[_MAX_PATH];
@@ -308,15 +336,8 @@ namespace
         return EndsWithCaseInsensitive(fullPath, ".json");
     }
 
-    JsErrorCode RequireJsonModule(const std::string& fullPath, JsValueRef* resultValue)
+    JsErrorCode ParseJsonText(const std::string& jsonText, JsValueRef* resultValue)
     {
-        std::string jsonText;
-        JsErrorCode errorCode = LoadTextFile(fullPath, &jsonText);
-        if (errorCode != JsNoError)
-        {
-            return errorCode;
-        }
-
         JsValueRef jsonTextValue = JS_INVALID_REFERENCE;
         JsValueRef globalObject = JS_INVALID_REFERENCE;
         JsValueRef jsonObject = JS_INVALID_REFERENCE;
@@ -324,7 +345,7 @@ namespace
         JsPropertyIdRef jsonProperty = JS_INVALID_REFERENCE;
         JsPropertyIdRef parseProperty = JS_INVALID_REFERENCE;
 
-        errorCode = ChakraRTInterface::JsCreateString(jsonText.c_str(), jsonText.length(), &jsonTextValue);
+        JsErrorCode errorCode = ChakraRTInterface::JsCreateString(jsonText.c_str(), jsonText.length(), &jsonTextValue);
         if (errorCode != JsNoError)
         {
             return errorCode;
@@ -364,6 +385,18 @@ namespace
         return ChakraRTInterface::JsCallFunction(parseFunction, parseArgs, _countof(parseArgs), resultValue);
     }
 
+    JsErrorCode RequireJsonModule(const std::string& fullPath, JsValueRef* resultValue)
+    {
+        std::string jsonText;
+        JsErrorCode errorCode = LoadTextFile(fullPath, &jsonText);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        return ParseJsonText(jsonText, resultValue);
+    }
+
     JsErrorCode RequireJavaScriptModule(const std::string& fullPath, JsValueRef* resultValue)
     {
         std::string scriptBody;
@@ -371,6 +404,12 @@ namespace
         if (errorCode != JsNoError)
         {
             return errorCode;
+        }
+
+        std::string transformedScriptBody;
+        if (TryTransformEs2021Source(scriptBody, &transformedScriptBody))
+        {
+            scriptBody = transformedScriptBody;
         }
 
         const std::string moduleDirectory = GetDirectoryFromFullPath(fullPath);
@@ -1044,8 +1083,37 @@ JsValueRef __stdcall WScriptJsrt::RequireCallback(JsValueRef callee, bool isCons
             return returnValue;
         }
 
+        if (strcmp(moduleName.GetString(), "chakra:es2020") == 0)
+        {
+            IfJsrtErrorSetGo(ChakraRTInterface::JsCreateObject(&returnValue));
+
+            if (!InstallObjectsOnObject(returnValue, "analyze", Es2020AnalyzeCallback))
+            {
+                errorCode = JsErrorFatal;
+                errorMessage = _u("Failed to initialize module exports for chakra:es2020.");
+                goto Error;
+            }
+
+            return returnValue;
+        }
+
+        if (strcmp(moduleName.GetString(), "chakra:es2021") == 0)
+        {
+            IfJsrtErrorSetGo(ChakraRTInterface::JsCreateObject(&returnValue));
+
+            if (!InstallObjectsOnObject(returnValue, "analyze", Es2021AnalyzeCallback) ||
+                !InstallObjectsOnObject(returnValue, "transform", Es2021TransformCallback))
+            {
+                errorCode = JsErrorFatal;
+                errorMessage = _u("Failed to initialize module exports for chakra:es2021.");
+                goto Error;
+            }
+
+            return returnValue;
+        }
+
         errorCode = JsErrorInvalidArgument;
-        errorMessage = _u("Unknown system package. Available modules: chakra:info, chakra:fs, chakra:reqwest.");
+        errorMessage = _u("Unknown system package. Available modules: chakra:info, chakra:fs, chakra:reqwest, chakra:es2020, chakra:es2021.");
         goto Error;
     }
 
@@ -1383,6 +1451,108 @@ Error:
     return returnValue;
 }
 
+JsValueRef __stdcall WScriptJsrt::Es2020AnalyzeCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString source;
+    std::string analysisJson;
+    std::string rustError;
+
+    if (argumentCount < 2)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:es2020.analyze expects a source argument.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(source.Initialize(arguments[1]));
+
+    if (!RustPackageBridge::TryEs2020Analyze(source.GetString(), &analysisJson, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:es2020.analyze failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ParseJsonText(analysisJson, &returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::Es2021AnalyzeCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString source;
+    std::string analysisJson;
+    std::string rustError;
+
+    if (argumentCount < 2)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:es2021.analyze expects a source argument.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(source.Initialize(arguments[1]));
+
+    if (!RustPackageBridge::TryEs2021Analyze(source.GetString(), &analysisJson, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:es2021.analyze failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ParseJsonText(analysisJson, &returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::Es2021TransformCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString source;
+    std::string transformedSource;
+    std::string rustError;
+
+    if (argumentCount < 2)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("chakra:es2021.transform expects a source argument.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(source.Initialize(arguments[1]));
+
+    if (!RustPackageBridge::TryEs2021Transform(source.GetString(), &transformedSource, &rustError))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("chakra:es2021.transform failed.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ChakraRTInterface::JsCreateString(transformedSource.c_str(), transformedSource.length(), &returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
 JsValueRef __stdcall WScriptJsrt::InfoVersionCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
 {
     HRESULT hr = E_FAIL;
@@ -1527,12 +1697,23 @@ JsErrorCode WScriptJsrt::LoadModuleFromString(LPCSTR fileName, LPCSTR fileConten
     IfJsrtErrorFailLogAndRetErrorCode(errorCode);
     JsValueRef errorObject = JS_INVALID_REFERENCE;
 
+    std::string transformedModuleSource;
+    const char* moduleSource = fileContent;
+    if (fileContent != nullptr)
+    {
+        const std::string moduleSourceText(fileContent);
+        if (TryTransformEs2021Source(moduleSourceText, &transformedModuleSource))
+        {
+            moduleSource = transformedModuleSource.c_str();
+        }
+    }
+
     // ParseModuleSource is sync, while additional fetch & evaluation are async.
-    unsigned int fileContentLength = (fileContent == nullptr) ? 0 : (unsigned int)strlen(fileContent);
+    unsigned int fileContentLength = (moduleSource == nullptr) ? 0 : (unsigned int)strlen(moduleSource);
  
-    errorCode = ChakraRTInterface::JsParseModuleSource(requestModule, dwSourceCookie, (LPBYTE)fileContent,
+    errorCode = ChakraRTInterface::JsParseModuleSource(requestModule, dwSourceCookie, (LPBYTE)moduleSource,
         fileContentLength, JsParseModuleSourceFlags_DataIsUTF8, &errorObject);
-    if ((errorCode != JsNoError) && errorObject != JS_INVALID_REFERENCE && fileContent != nullptr && !HostConfigFlags::flags.IgnoreScriptErrorCode && moduleErrMap[requestModule] == RootModule)
+    if ((errorCode != JsNoError) && errorObject != JS_INVALID_REFERENCE && moduleSource != nullptr && !HostConfigFlags::flags.IgnoreScriptErrorCode && moduleErrMap[requestModule] == RootModule)
     {
         ChakraRTInterface::JsSetException(errorObject);
         moduleErrMap[requestModule] = ErroredModule;
