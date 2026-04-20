@@ -14,6 +14,7 @@ set(ch_source_files
   HostConfigFlags.cpp
   WScriptJsrt.cpp
   RuntimeThreadData.cpp
+  RustPackageBridge.cpp
   )
 
 if (STATIC_LIBRARY)

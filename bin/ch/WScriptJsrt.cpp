@@ -5,6 +5,7 @@
 //-------------------------------------------------------------------------------------------------------
 #include "stdafx.h"
 #include "PlatformAgnostic/ChakraICU.h"
+#include "RustPackageBridge.h"
 #ifdef __valid
 #undef __valid
 #endif
@@ -551,6 +552,75 @@ JsValueRef __stdcall WScriptJsrt::LoadScriptCallback(JsValueRef callee, bool isC
 JsValueRef __stdcall WScriptJsrt::LoadModuleCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
 {
     return LoadScriptHelper(callee, isConstructCall, arguments, argumentCount, callbackState, true);
+}
+
+JsValueRef __stdcall WScriptJsrt::RequireCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    AutoString moduleName;
+
+    if (argumentCount < 2)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("require expects a module specifier, for example require('chakra:info').");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(moduleName.Initialize(arguments[1]));
+
+    if (strcmp(moduleName.GetString(), "chakra:info") == 0)
+    {
+        IfJsrtErrorSetGo(ChakraRTInterface::JsCreateObject(&returnValue));
+
+        if (!InstallObjectsOnObject(returnValue, "version", InfoVersionCallback))
+        {
+            errorCode = JsErrorFatal;
+            errorMessage = _u("Failed to initialize module exports for chakra:info.");
+            goto Error;
+        }
+
+        return returnValue;
+    }
+
+    if (strncmp(moduleName.GetString(), "chakra:", strlen("chakra:")) != 0)
+    {
+        errorCode = JsErrorInvalidArgument;
+        errorMessage = _u("Only system packages are supported. Use names in the form chakra:<name>.");
+        goto Error;
+    }
+
+    errorCode = JsErrorInvalidArgument;
+    errorMessage = _u("Unknown system package. Available modules: chakra:info.");
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
+}
+
+JsValueRef __stdcall WScriptJsrt::InfoVersionCallback(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState)
+{
+    HRESULT hr = E_FAIL;
+    JsErrorCode errorCode = JsNoError;
+    LPCWSTR errorMessage = _u("");
+    JsValueRef returnValue = JS_INVALID_REFERENCE;
+    std::string version;
+
+    if (!RustPackageBridge::TryGetInfoVersion(&version))
+    {
+        errorCode = JsErrorFatal;
+        errorMessage = _u("Rust package runtime for chakra:info was not found. Build bin/ch/rust/chakra_packages and set CHAKRA_RUST_PACKAGES_PATH or copy the library next to ch.exe.");
+        goto Error;
+    }
+
+    IfJsrtErrorSetGo(ChakraRTInterface::JsCreateString(version.c_str(), version.length(), &returnValue));
+    return returnValue;
+
+Error:
+    SetExceptionIf(errorCode, errorMessage);
+    return returnValue;
 }
 
 JsValueRef WScriptJsrt::LoadScriptHelper(JsValueRef callee, bool isConstructCall, JsValueRef *arguments, unsigned short argumentCount, void *callbackState, bool isSourceModule)
@@ -1204,6 +1274,7 @@ bool WScriptJsrt::Initialize()
     IfJsrtErrorFail(ChakraRTInterface::JsSetProperty(global, wscriptName, wscript, true), false);
 
     IfFalseGo(WScriptJsrt::InstallObjectsOnObject(global, "print", EchoCallback));
+    IfFalseGo(WScriptJsrt::InstallObjectsOnObject(global, "require", RequireCallback));
 
     IfFalseGo(WScriptJsrt::InstallObjectsOnObject(global, "read", LoadTextFileCallback));
     IfFalseGo(WScriptJsrt::InstallObjectsOnObject(global, "readbuffer", LoadBinaryFileCallback));

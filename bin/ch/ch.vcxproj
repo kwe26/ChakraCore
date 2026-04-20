@@ -68,6 +68,7 @@
     <ClInclude Include="HostConfigFlagsList.h" />
     <ClInclude Include="JITProcessManager.h" />
     <ClInclude Include="MessageQueue.h" />
+    <ClInclude Include="RustPackageBridge.h" />
     <ClInclude Include="RuntimeThreadData.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="WScriptJsrt.h" />
@@ -80,6 +81,7 @@
     <ClCompile Include="Helpers.cpp" />
     <ClCompile Include="HostConfigFlags.cpp" />
     <ClCompile Include="JITProcessManager.cpp" />
+    <ClCompile Include="RustPackageBridge.cpp" />
     <ClCompile Include="RuntimeThreadData.cpp" />
     <ClCompile Include="WScriptJsrt.cpp" />
   </ItemGroup>
