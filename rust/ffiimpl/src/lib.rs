@@ -73,10 +73,23 @@ pub unsafe extern "C" fn chakra_ffi_dlopen(path: *const u8, path_len: usize) -> 
         return FfiHandle::null();
     }
 
+    // Resolve if it's a symlink
+
+    // update symlink path if it was resolved successfully
     let path_slice = std::slice::from_raw_parts(path, path_len);
     let path_str = match std::str::from_utf8(path_slice) {
         Ok(s) => s,
         Err(_) => return FfiHandle::null(),
+    };
+
+    let resolved_path = match std::fs::canonicalize(path_str) {
+        Ok(p) => p,
+        Err(_) => return FfiHandle::null(),
+    };
+
+    let path_str = match resolved_path.to_str() {
+        Some(s) => s,
+        None => return FfiHandle::null(),
     };
 
     match Library::new(path_str) {

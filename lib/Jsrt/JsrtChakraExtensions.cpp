@@ -34,9 +34,9 @@
 #endif
 
 // Forward declarations
-CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject);
-CHAKRA_API JsInstallHttpServer(_Out_opt_ JsValueRef* serverObject);
-CHAKRA_API JsInstallHttpServerMulti(_Out_opt_ JsValueRef* serverObject);
+extern CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject);
+extern CHAKRA_API JsInstallHttpServer(_Out_opt_ JsValueRef* serverObject);
+extern CHAKRA_API JsInstallHttpServerMulti(_Out_opt_ JsValueRef* serverObject);
 
 namespace
 {
@@ -2426,6 +2426,110 @@ namespace
         return resultValue;
     }
 
+    JsValueRef CHAKRA_CALLBACK FfiBoundFunctionCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+
+        if (callbackState == nullptr)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.func: invalid bound function state");
+        }
+
+        void* funcPtr = callbackState;
+
+        uint64_t callArgs[8] = { 0 };
+        uint32_t argc = 0;
+        if (argumentCount > 1)
+        {
+            const uint32_t providedArgCount = static_cast<uint32_t>(argumentCount - 1);
+            argc = providedArgCount > 8 ? 8 : providedArgCount;
+            for (uint32_t i = 0; i < argc; ++i)
+            {
+                double value = 0.0;
+                if (JsNumberToDouble(arguments[i + 1], &value) != JsNoError)
+                {
+                    return SetExceptionAndReturnInvalidReference("ffi.func: all arguments must be numbers");
+                }
+                callArgs[i] = static_cast<uint64_t>(value);
+            }
+        }
+
+        std::string errorMessage;
+        if (!EnsureFfiApiLoaded(&errorMessage))
+        {
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        const uint64_t result = g_ffiApi.call(funcPtr, argc, callArgs);
+
+        JsValueRef resultValue = JS_INVALID_REFERENCE;
+        JsDoubleToNumber(static_cast<double>(result), &resultValue);
+        return resultValue;
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiFuncCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 3)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.func requires (handle, symbol)");
+        }
+
+        double handleNum = 0.0;
+        if (JsNumberToDouble(arguments[1], &handleNum) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.func: handle must be a number");
+        }
+
+        std::string symbolStr;
+        if (ConvertValueToUtf8String(arguments[2], &symbolStr) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.func: symbol must be a string");
+        }
+
+        ChakraFfiHandle handle;
+        handle.handle = static_cast<uint64_t>(handleNum);
+
+        std::string errorMessage;
+        if (!EnsureFfiApiLoaded(&errorMessage))
+        {
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        void* funcPtr = g_ffiApi.dlsym(
+            handle,
+            reinterpret_cast<const uint8_t*>(symbolStr.c_str()),
+            symbolStr.length() + 1);
+
+        if (funcPtr == nullptr)
+        {
+            SetFfiErrorMessage(&errorMessage, "ffi.func: symbol not found");
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        JsValueRef functionValue = JS_INVALID_REFERENCE;
+        if (JsCreateFunction(FfiBoundFunctionCallback, funcPtr, &functionValue) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.func: failed to create bound function");
+        }
+
+        return functionValue;
+    }
+
     JsValueRef CHAKRA_CALLBACK FfiCloseCallback(
         _In_ JsValueRef callee,
         _In_ bool isConstructCall,
@@ -2465,7 +2569,7 @@ namespace
     }
 }
 
-CHAKRA_API JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction);
+extern CHAKRA_API JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction);
 
 JsErrorCode JsEnsureChakraSystemRequireIfMissing()
 {
@@ -2633,6 +2737,20 @@ namespace
 
     std::map<uint64_t, HttpServerState> g_httpServers;
     uint64_t g_nextHttpServerId = 1;
+
+    JsValueRef CHAKRA_CALLBACK HttpServerOnCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState);
+
+    JsValueRef CHAKRA_CALLBACK HttpServerEndCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState);
 
     JsValueRef CHAKRA_CALLBACK HttpServerServeCallback(
         _In_ JsValueRef callee,
@@ -2914,6 +3032,19 @@ CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject)
         return errorCode;
     }
     errorCode = SetPropertyByName(ffiObj, "call", callFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.func
+    JsValueRef funcFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiFuncCallback, nullptr, &funcFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "func", funcFunc);
     if (errorCode != JsNoError)
     {
         return errorCode;
