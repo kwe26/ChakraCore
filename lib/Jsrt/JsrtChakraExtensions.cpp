@@ -2993,35 +2993,6 @@ namespace
         return descriptor;
     }
 
-    JsValueRef CHAKRA_CALLBACK FfiPtrCallback(
-        _In_ JsValueRef callee,
-        _In_ bool isConstructCall,
-        _In_ JsValueRef *arguments,
-        _In_ unsigned short argumentCount,
-        _In_opt_ void *callbackState)
-    {
-        UNREFERENCED_PARAMETER(callee);
-        UNREFERENCED_PARAMETER(isConstructCall);
-        UNREFERENCED_PARAMETER(callbackState);
-
-        JsValueRef descriptor = JS_INVALID_REFERENCE;
-        if (CreatePrimitiveTypeDescriptorValue("ptr", &descriptor) != JsNoError)
-        {
-            return SetExceptionAndReturnInvalidReference("ffi.ptr: failed to create pointer type descriptor");
-        }
-
-        if (argumentCount > 1)
-        {
-            JsValueType targetType = JsUndefined;
-            if (JsGetValueType(arguments[1], &targetType) == JsNoError && targetType != JsUndefined && targetType != JsNull)
-            {
-                SetPropertyByName(descriptor, "to", arguments[1]);
-            }
-        }
-
-        return descriptor;
-    }
-
     JsErrorCode CreatePrimitiveTypeDescriptorValue(const char* primitiveName, JsValueRef* descriptorValue)
     {
         if (primitiveName == nullptr || descriptorValue == nullptr)
@@ -3066,6 +3037,35 @@ namespace
 
         *descriptorValue = descriptor;
         return JsNoError;
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiPtrCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        JsValueRef descriptor = JS_INVALID_REFERENCE;
+        if (CreatePrimitiveTypeDescriptorValue("ptr", &descriptor) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.ptr: failed to create pointer type descriptor");
+        }
+
+        if (argumentCount > 1)
+        {
+            JsValueType targetType = JsUndefined;
+            if (JsGetValueType(arguments[1], &targetType) == JsNoError && targetType != JsUndefined && targetType != JsNull)
+            {
+                SetPropertyByName(descriptor, "to", arguments[1]);
+            }
+        }
+
+        return descriptor;
     }
 
     JsErrorCode InstallFfiTypesObject(JsValueRef ffiObj)
