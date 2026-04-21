@@ -182,11 +182,12 @@ namespace
         return specifier;
     }
 
+    // AFTER
     bool ShouldTryEs2021Transform(const std::string& sourceText)
     {
         return sourceText.find("&&=") != std::string::npos ||
             sourceText.find("||=") != std::string::npos ||
-            sourceText.find("??=") != std::string::npos;
+            sourceText.find("?" "?=") != std::string::npos;  // split to avoid trigraph
     }
 
     bool TryTransformEs2021Source(const std::string& sourceText, std::string* transformedText)

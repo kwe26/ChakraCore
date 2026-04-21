@@ -113,3 +113,4 @@ Build/VcBuild.SWB
 
 # Rust
 target/
+dist/

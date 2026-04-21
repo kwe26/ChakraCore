@@ -157,7 +157,7 @@ namespace
         free(envValue);
         return true;
 #else
-        const char* envValue = std::getenv(variableName);
+        const char* envValue = getenv(variableName);
         if (envValue == nullptr || envValue[0] == '\0')
         {
             return false;

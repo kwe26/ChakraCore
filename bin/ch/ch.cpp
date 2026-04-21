@@ -190,7 +190,7 @@ bool ShouldTryEs2021Transform(const char* sourceText)
 
     return strstr(sourceText, "&&=") != nullptr ||
         strstr(sourceText, "||=") != nullptr ||
-        strstr(sourceText, "??=") != nullptr;
+        strstr(sourceText, "??" "=") != nullptr;
 }
 
 bool IsReplExitCommand(const char* line)

@@ -126,6 +126,91 @@ BUILD_RUST_PACKAGES() {
     echo "CHAKRA_RUST_PACKAGES_PATH=$CHAKRA_RUST_PACKAGES_PATH"
 }
 
+BUILD_RUST_RUNTIME() {
+    local RUST_RUNTIME_DIR="$CHAKRACORE_DIR/rust/runtime"
+    if [[ ! -d "$RUST_RUNTIME_DIR" ]]; then
+        echo "Rust runtime directory not found at '$RUST_RUNTIME_DIR'. Skipping Rust runtime build."
+        return
+    fi
+
+    local CARGO_PATH=$(which cargo 2> /dev/null)
+    if [[ -z "$CARGO_PATH" || ! -x "$CARGO_PATH" ]]; then
+        echo "ERROR: cargo not found. Install Rust toolchain to build the Rust runtime host."
+        exit 1
+    fi
+
+    local RUST_BUILD_PROFILE="debug"
+    local CARGO_ARGS="build"
+    if [[ "$BUILD_TYPE" != "Debug" ]]; then
+        RUST_BUILD_PROFILE="release"
+        CARGO_ARGS="build --release"
+    fi
+
+    echo "Building Rust runtime crate at $RUST_RUNTIME_DIR"
+    pushd "$RUST_RUNTIME_DIR" > /dev/null
+    $CARGO_PATH $CARGO_ARGS --manifest-path "$RUST_RUNTIME_DIR/Cargo.toml"
+    local RUST_RET=$?
+    popd > /dev/null
+
+    if [[ $RUST_RET != 0 ]]; then
+        echo "ERROR: Rust runtime build failed with exit code $RUST_RET"
+        exit $RUST_RET
+    fi
+
+    CHAKRA_RUST_RUNTIME_PATH="$RUST_RUNTIME_DIR/target/$RUST_BUILD_PROFILE/chakra_runtime"
+    export CHAKRA_RUST_RUNTIME_PATH
+    echo "CHAKRA_RUST_RUNTIME_PATH=$CHAKRA_RUST_RUNTIME_PATH"
+}
+
+STAGE_LINUX_OUTPUT() {
+    if [[ $OS_LINUX != 1 ]]; then
+        return
+    fi
+
+    if [[ $TARGET_OS =~ "CC_TARGET_OS_ANDROID_SH=1" ]]; then
+        return
+    fi
+
+    if [[ -z "$BUILD_ARCH_NAME" ]]; then
+        return
+    fi
+
+    local LINUX_STAGE_ROOT="$CHAKRACORE_DIR/dist/linux-$BUILD_ARCH_NAME"
+    local LINUX_STAGE_DIR="$LINUX_STAGE_ROOT/$BUILD_TYPE_DIR"
+
+    mkdir -p "$LINUX_STAGE_DIR"
+
+    if [[ -f "$BUILD_DIRECTORY/ch" ]]; then
+        cp "$BUILD_DIRECTORY/ch" "$LINUX_STAGE_DIR/"
+    fi
+
+    if [[ -f "$BUILD_DIRECTORY/libChakraCore.so" ]]; then
+        cp "$BUILD_DIRECTORY/libChakraCore.so" "$LINUX_STAGE_DIR/"
+    fi
+
+    if [[ -n "$CHAKRA_RUST_PACKAGES_PATH" && -f "$CHAKRA_RUST_PACKAGES_PATH/libchakra_packages.so" ]]; then
+        cp "$CHAKRA_RUST_PACKAGES_PATH/libchakra_packages.so" "$LINUX_STAGE_DIR/"
+    fi
+
+    if [[ -n "$CHAKRA_RUST_RUNTIME_PATH" && -f "$CHAKRA_RUST_RUNTIME_PATH" ]]; then
+        cp "$CHAKRA_RUST_RUNTIME_PATH" "$LINUX_STAGE_DIR/chakra_runtime"
+    fi
+
+    if [[ -f "$CHAKRACORE_DIR/README.md" ]]; then
+        cp "$CHAKRACORE_DIR/README.md" "$LINUX_STAGE_DIR/README.md"
+    fi
+
+    if [[ -f "$CHAKRACORE_DIR/LICENSE.txt" ]]; then
+        cp "$CHAKRACORE_DIR/LICENSE.txt" "$LINUX_STAGE_DIR/LICENSE.txt"
+    fi
+
+    if [[ -f "$CHAKRACORE_DIR/THIRD-PARTY-NOTICES.txt" ]]; then
+        cp "$CHAKRACORE_DIR/THIRD-PARTY-NOTICES.txt" "$LINUX_STAGE_DIR/THIRD-PARTY-NOTICES.txt"
+    fi
+
+    echo "Linux runtime bundle staged under $LINUX_STAGE_DIR"
+}
+
 pushd `dirname $0` > /dev/null
 CHAKRACORE_DIR=`pwd -P`
 popd > /dev/null
@@ -163,6 +248,7 @@ CMAKE_EXPORT_COMPILE_COMMANDS="-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
 LIBS_ONLY_BUILD=
 ALWAYS_YES=
 CCACHE_NAME=
+BUILD_ARCH_NAME=""
 PYTHON_BINARY=$(which python3 || which python || which python2.7 || which python2 || which python 2> /dev/null)
 
 UNAME_S=`uname -s`
@@ -651,24 +737,46 @@ fi
 # Rust-backed host packages must be built before building ch so runtime require("chakra:...") is ready.
 if [[ ! $TARGET_OS =~ "CC_TARGET_OS_ANDROID_SH=1" ]]; then
     BUILD_RUST_PACKAGES
+    BUILD_RUST_RUNTIME
 fi
 
 pushd $BUILD_DIRECTORY > /dev/null
 
 if [[ $ARCH =~ "x86" ]]; then
     ARCH="-DCC_TARGETS_X86_SH=1"
+    BUILD_ARCH_NAME="x86"
     echo "Compile Target : x86"
 elif [[ $ARCH =~ "arm" ]]; then
     ARCH="-DCC_TARGETS_ARM_SH=1"
+    BUILD_ARCH_NAME="arm"
     echo "Compile Target : arm"
 elif [[ $ARCH =~ "arm64" || $ARCH =~ "aarch64" ]]; then
     ARCH="-DCC_TARGETS_ARM64_SH=1"
+    BUILD_ARCH_NAME="arm64"
     echo "Compile Target : arm64"
 elif [[ $ARCH =~ "amd64" ]]; then
     ARCH="-DCC_TARGETS_AMD64_SH=1"
+    BUILD_ARCH_NAME="x64"
     echo "Compile Target : amd64"
 else
     ARCH="-DCC_USES_SYSTEM_ARCH_SH=1"
+    case `uname -m` in
+        x86_64|amd64)
+            BUILD_ARCH_NAME="x64"
+            ;;
+        aarch64|arm64)
+            BUILD_ARCH_NAME="arm64"
+            ;;
+        armv7l|armv8l)
+            BUILD_ARCH_NAME="arm"
+            ;;
+        i386|i486|i586|i686)
+            BUILD_ARCH_NAME="x86"
+            ;;
+        *)
+            BUILD_ARCH_NAME=`uname -m`
+            ;;
+    esac
     echo "Compile Target : System Default"
 fi
 
@@ -703,6 +811,8 @@ fi
 if [[ $_RET != 0 ]]; then
     echo "See error details above. Exit code was $_RET"
 else
+    STAGE_LINUX_OUTPUT
+
     if [[ $CREATE_DEB != 0 ]]; then
         DEB_FOLDER=`realpath .`
         DEB_FOLDER="${DEB_FOLDER}/chakracore_${CREATE_DEB}"

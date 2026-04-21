@@ -6,6 +6,7 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Context as RustylineContext, Editor, Helper};
 use libloading::{Library, Symbol};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
 use std::fmt::Write as _;
@@ -13,192 +14,91 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
-type JsErrorCode = i32;
-type JsRuntimeHandle = *mut c_void;
-type JsContextRef = *mut c_void;
-type JsValueRef = *mut c_void;
-type JsPropertyIdRef = *mut c_void;
-type JsSourceContext = usize;
+// ─── JSRT type aliases ──────────────────────────────────────────────────────
+
+type JsErrorCode         = i32;
+type JsRuntimeHandle     = *mut c_void;
+type JsContextRef        = *mut c_void;
+type JsValueRef          = *mut c_void;
+type JsPropertyIdRef     = *mut c_void;
+type JsSourceContext     = usize;
 type JsRuntimeAttributes = u32;
 type JsParseScriptAttributes = u32;
-type JsValueType = u32;
+type JsValueType         = u32;
 
-const JS_NO_ERROR: JsErrorCode = 0;
+// ─── JSRT constants ─────────────────────────────────────────────────────────
+
+const JS_NO_ERROR: JsErrorCode          = 0;
 const JS_ERROR_SCRIPT_EXCEPTION: JsErrorCode = 0x30001;
-const JS_ERROR_SCRIPT_COMPILE: JsErrorCode = 0x30002;
-const JS_RUNTIME_ATTRIBUTE_NONE: JsRuntimeAttributes = 0;
+const JS_ERROR_SCRIPT_COMPILE: JsErrorCode   = 0x30002;
+const JS_RUNTIME_ATTRIBUTE_NONE: JsRuntimeAttributes     = 0;
 const JS_PARSE_SCRIPT_ATTRIBUTE_NONE: JsParseScriptAttributes = 0;
 const JS_VALUE_TYPE_UNDEFINED: JsValueType = 0;
 
-#[cfg(target_os = "windows")]
-type JsNativeFunction = Option<
-    unsafe extern "system" fn(
-        callee: JsValueRef,
-        is_construct_call: bool,
-        arguments: *mut JsValueRef,
-        argument_count: u16,
-        callback_state: *mut c_void,
-    ) -> JsValueRef,
->;
+// ─── Calling-convention shims ────────────────────────────────────────────────
+// All fn-pointer types are defined once per platform to avoid repetition.
 
-#[cfg(not(target_os = "windows"))]
-type JsNativeFunction = Option<
-    unsafe extern "C" fn(
-        callee: JsValueRef,
-        is_construct_call: bool,
-        arguments: *mut JsValueRef,
-        argument_count: u16,
-        callback_state: *mut c_void,
-    ) -> JsValueRef,
->;
+macro_rules! js_fn {
+    ($name:ident ( $($arg:ty),* ) -> $ret:ty) => {
+        #[cfg(target_os = "windows")]
+        type $name = unsafe extern "system" fn($($arg),*) -> $ret;
+        #[cfg(not(target_os = "windows"))]
+        type $name = unsafe extern "C" fn($($arg),*) -> $ret;
+    };
+}
 
-#[cfg(target_os = "windows")]
-type JsCreateRuntimeFn =
-    unsafe extern "system" fn(JsRuntimeAttributes, *mut c_void, *mut JsRuntimeHandle) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsCreateRuntimeFn =
-    unsafe extern "C" fn(JsRuntimeAttributes, *mut c_void, *mut JsRuntimeHandle) -> JsErrorCode;
+js_fn!(JsNativeFunctionRaw(JsValueRef, bool, *mut JsValueRef, u16, *mut c_void) -> JsValueRef);
+type JsNativeFunction = Option<JsNativeFunctionRaw>;
 
-#[cfg(target_os = "windows")]
-type JsDisposeRuntimeFn = unsafe extern "system" fn(JsRuntimeHandle) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsDisposeRuntimeFn = unsafe extern "C" fn(JsRuntimeHandle) -> JsErrorCode;
+js_fn!(JsCreateRuntimeFn    (JsRuntimeAttributes, *mut c_void, *mut JsRuntimeHandle) -> JsErrorCode);
+js_fn!(JsDisposeRuntimeFn   (JsRuntimeHandle) -> JsErrorCode);
+js_fn!(JsCreateContextFn    (JsRuntimeHandle, *mut JsContextRef) -> JsErrorCode);
+js_fn!(JsSetCurrentContextFn(JsContextRef) -> JsErrorCode);
+js_fn!(JsCreateStringFn     (*const u8, usize, *mut JsValueRef) -> JsErrorCode);
+js_fn!(JsRunFn              (JsValueRef, JsSourceContext, JsValueRef, JsParseScriptAttributes, *mut JsValueRef) -> JsErrorCode);
+js_fn!(JsGetAndClearExceptionFn(*mut JsValueRef) -> JsErrorCode);
+js_fn!(JsConvertValueToStringFn(JsValueRef, *mut JsValueRef) -> JsErrorCode);
+js_fn!(JsCopyStringFn       (JsValueRef, *mut i8, usize, *mut usize) -> JsErrorCode);
+js_fn!(JsGetGlobalObjectFn  (*mut JsValueRef) -> JsErrorCode);
+js_fn!(JsCreateFunctionFn   (JsNativeFunction, *mut c_void, *mut JsValueRef) -> JsErrorCode);
+js_fn!(JsCreateObjectFn     (*mut JsValueRef) -> JsErrorCode);
+js_fn!(JsCreatePropertyIdFn (*const u8, usize, *mut JsPropertyIdRef) -> JsErrorCode);
+js_fn!(JsSetPropertyFn      (JsValueRef, JsPropertyIdRef, JsValueRef, bool) -> JsErrorCode);
+js_fn!(JsGetUndefinedValueFn(*mut JsValueRef) -> JsErrorCode);
+js_fn!(JsGetValueTypeFn     (JsValueRef, *mut JsValueType) -> JsErrorCode);
+js_fn!(JsInstallChakraSystemRequireFn(*mut JsValueRef) -> JsErrorCode);
+js_fn!(JsChakraEs2021TransformFn(JsValueRef, *mut JsValueRef) -> JsErrorCode);
 
-#[cfg(target_os = "windows")]
-type JsCreateContextFn = unsafe extern "system" fn(JsRuntimeHandle, *mut JsContextRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsCreateContextFn = unsafe extern "C" fn(JsRuntimeHandle, *mut JsContextRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsSetCurrentContextFn = unsafe extern "system" fn(JsContextRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsSetCurrentContextFn = unsafe extern "C" fn(JsContextRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsCreateStringFn = unsafe extern "system" fn(*const u8, usize, *mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsCreateStringFn = unsafe extern "C" fn(*const u8, usize, *mut JsValueRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsRunFn = unsafe extern "system" fn(
-    JsValueRef,
-    JsSourceContext,
-    JsValueRef,
-    JsParseScriptAttributes,
-    *mut JsValueRef,
-) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsRunFn = unsafe extern "C" fn(
-    JsValueRef,
-    JsSourceContext,
-    JsValueRef,
-    JsParseScriptAttributes,
-    *mut JsValueRef,
-) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsGetAndClearExceptionFn = unsafe extern "system" fn(*mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsGetAndClearExceptionFn = unsafe extern "C" fn(*mut JsValueRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsConvertValueToStringFn = unsafe extern "system" fn(JsValueRef, *mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsConvertValueToStringFn = unsafe extern "C" fn(JsValueRef, *mut JsValueRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsCopyStringFn = unsafe extern "system" fn(JsValueRef, *mut i8, usize, *mut usize) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsCopyStringFn = unsafe extern "C" fn(JsValueRef, *mut i8, usize, *mut usize) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsGetGlobalObjectFn = unsafe extern "system" fn(*mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsGetGlobalObjectFn = unsafe extern "C" fn(*mut JsValueRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsCreateFunctionFn =
-    unsafe extern "system" fn(JsNativeFunction, *mut c_void, *mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsCreateFunctionFn =
-    unsafe extern "C" fn(JsNativeFunction, *mut c_void, *mut JsValueRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsCreateObjectFn = unsafe extern "system" fn(*mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsCreateObjectFn = unsafe extern "C" fn(*mut JsValueRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsCreatePropertyIdFn = unsafe extern "system" fn(*const u8, usize, *mut JsPropertyIdRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsCreatePropertyIdFn = unsafe extern "C" fn(*const u8, usize, *mut JsPropertyIdRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsSetPropertyFn = unsafe extern "system" fn(
-    JsValueRef,
-    JsPropertyIdRef,
-    JsValueRef,
-    bool,
-) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsSetPropertyFn =
-    unsafe extern "C" fn(JsValueRef, JsPropertyIdRef, JsValueRef, bool) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsGetUndefinedValueFn = unsafe extern "system" fn(*mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsGetUndefinedValueFn = unsafe extern "C" fn(*mut JsValueRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsGetValueTypeFn = unsafe extern "system" fn(JsValueRef, *mut JsValueType) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsGetValueTypeFn = unsafe extern "C" fn(JsValueRef, *mut JsValueType) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsInstallChakraSystemRequireFn = unsafe extern "system" fn(*mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsInstallChakraSystemRequireFn = unsafe extern "C" fn(*mut JsValueRef) -> JsErrorCode;
-
-#[cfg(target_os = "windows")]
-type JsChakraEs2021TransformFn = unsafe extern "system" fn(JsValueRef, *mut JsValueRef) -> JsErrorCode;
-#[cfg(not(target_os = "windows"))]
-type JsChakraEs2021TransformFn = unsafe extern "C" fn(JsValueRef, *mut JsValueRef) -> JsErrorCode;
+// ─── ChakraApi ───────────────────────────────────────────────────────────────
 
 struct ChakraApi {
     _library: Library,
-    js_create_runtime: JsCreateRuntimeFn,
-    js_dispose_runtime: JsDisposeRuntimeFn,
-    js_create_context: JsCreateContextFn,
-    js_set_current_context: JsSetCurrentContextFn,
-    js_create_string: JsCreateStringFn,
-    js_run: JsRunFn,
-    js_get_and_clear_exception: JsGetAndClearExceptionFn,
-    js_convert_value_to_string: JsConvertValueToStringFn,
-    js_copy_string: JsCopyStringFn,
-    js_get_global_object: JsGetGlobalObjectFn,
-    js_create_function: JsCreateFunctionFn,
-    js_create_object: JsCreateObjectFn,
-    js_create_property_id: JsCreatePropertyIdFn,
-    js_set_property: JsSetPropertyFn,
-    js_get_undefined_value: JsGetUndefinedValueFn,
-    js_get_value_type: JsGetValueTypeFn,
+    js_create_runtime:             JsCreateRuntimeFn,
+    js_dispose_runtime:            JsDisposeRuntimeFn,
+    js_create_context:             JsCreateContextFn,
+    js_set_current_context:        JsSetCurrentContextFn,
+    js_create_string:              JsCreateStringFn,
+    js_run:                        JsRunFn,
+    js_get_and_clear_exception:    JsGetAndClearExceptionFn,
+    js_convert_value_to_string:    JsConvertValueToStringFn,
+    js_copy_string:                JsCopyStringFn,
+    js_get_global_object:          JsGetGlobalObjectFn,
+    js_create_function:            JsCreateFunctionFn,
+    js_create_object:              JsCreateObjectFn,
+    js_create_property_id:         JsCreatePropertyIdFn,
+    js_set_property:               JsSetPropertyFn,
+    js_get_undefined_value:        JsGetUndefinedValueFn,
+    js_get_value_type:             JsGetValueTypeFn,
     js_install_chakra_system_require: Option<JsInstallChakraSystemRequireFn>,
-    js_chakra_es2021_transform: Option<JsChakraEs2021TransformFn>,
+    js_chakra_es2021_transform:    Option<JsChakraEs2021TransformFn>,
 }
 
-struct HostRuntime {
-    api: ChakraApi,
-    runtime: JsRuntimeHandle,
-    print_callback_state: Box<PrintCallbackState>,
-    console_callback_states: Vec<Box<ConsoleCallbackState>>,
-}
+// ─── Console method kinds ────────────────────────────────────────────────────
 
-struct PrintCallbackState {
-    api: *const ChakraApi,
-}
-
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum ConsoleMethodKind {
     Log,
     Info,
@@ -206,12 +106,71 @@ enum ConsoleMethodKind {
     Error,
     Debug,
     Dir,
+    Trace,
+    Assert,
+    // counter variants store their label index into a shared AtomicUsize pool
+    Count,
+    CountReset,
+    // timer variants
+    Time,
+    TimeEnd,
+    TimeLog,
+    // grouping
+    Group,
+    GroupEnd,
+    // table
+    Table,
+    // clear terminal
+    Clear,
 }
 
-struct ConsoleCallbackState {
+// ─── Callback state structs ──────────────────────────────────────────────────
+
+struct PrintCallbackState {
     api: *const ChakraApi,
-    kind: ConsoleMethodKind,
 }
+
+// Shared state threaded through all console callbacks via a raw pointer
+// to a ConsoleSharedState that lives in HostRuntime.
+struct ConsoleSharedState {
+    counters:    HashMap<String, u64>,
+    timers:      HashMap<String, Instant>,
+    group_depth: usize,
+}
+
+impl ConsoleSharedState {
+    fn new() -> Self {
+        Self {
+            counters:    HashMap::new(),
+            timers:      HashMap::new(),
+            group_depth: 0,
+        }
+    }
+
+    fn indent(&self) -> String {
+        "  ".repeat(self.group_depth)
+    }
+}
+
+// Extended callback state that also holds a pointer to shared state
+struct ConsoleCallbackStateEx {
+    api:    *const ChakraApi,
+    kind:   ConsoleMethodKind,
+    shared: *mut ConsoleSharedState,
+}
+
+// ─── HostRuntime ─────────────────────────────────────────────────────────────
+
+struct HostRuntime {
+    api:                    ChakraApi,
+    runtime:                JsRuntimeHandle,
+    // keep alive
+    _print_state:           Box<PrintCallbackState>,
+    _console_states:        Vec<Box<ConsoleCallbackStateEx>>,
+    console_shared:         Box<ConsoleSharedState>,
+}
+
+// ─── ReplHelper (rustyline) ──────────────────────────────────────────────────
 
 struct ReplHelper {
     keywords: &'static [&'static str],
@@ -221,23 +180,13 @@ impl Helper for ReplHelper {}
 
 impl Completer for ReplHelper {
     type Candidate = Pair;
-
-    fn complete(
-        &self,
-        _line: &str,
-        _pos: usize,
-        _ctx: &RustylineContext<'_>,
-    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        Ok((0, Vec::new()))
-    }
+    fn complete(&self, _line: &str, _pos: usize, _ctx: &RustylineContext<'_>)
+        -> rustyline::Result<(usize, Vec<Pair>)> { Ok((0, vec![])) }
 }
 
 impl Hinter for ReplHelper {
     type Hint = String;
-
-    fn hint(&self, _line: &str, _pos: usize, _ctx: &RustylineContext<'_>) -> Option<String> {
-        None
-    }
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &RustylineContext<'_>) -> Option<String> { None }
 }
 
 impl Validator for ReplHelper {
@@ -250,606 +199,721 @@ impl Highlighter for ReplHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         Cow::Owned(highlight_js_line(line, self.keywords))
     }
-
-    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
-        &'s self,
-        prompt: &'p str,
-        _default: bool,
-    ) -> Cow<'b, str> {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, _default: bool) -> Cow<'b, str> {
         Cow::Owned(format!("\x1b[1;32m{}\x1b[0m", prompt))
     }
-
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
         Cow::Owned(format!("\x1b[2m{}\x1b[0m", hint))
     }
 }
 
+// ─── print() native callback ─────────────────────────────────────────────────
+
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn print_callback(
-    _callee: JsValueRef,
-    _is_construct_call: bool,
-    arguments: *mut JsValueRef,
-    argument_count: u16,
-    callback_state: *mut c_void,
-) -> JsValueRef {
-    print_callback_impl(arguments, argument_count, callback_state)
-}
+    _: JsValueRef, _: bool, args: *mut JsValueRef, argc: u16, state: *mut c_void,
+) -> JsValueRef { print_callback_impl(args, argc, state) }
 
 #[cfg(not(target_os = "windows"))]
 unsafe extern "C" fn print_callback(
-    _callee: JsValueRef,
-    _is_construct_call: bool,
-    arguments: *mut JsValueRef,
-    argument_count: u16,
-    callback_state: *mut c_void,
-) -> JsValueRef {
-    print_callback_impl(arguments, argument_count, callback_state)
+    _: JsValueRef, _: bool, args: *mut JsValueRef, argc: u16, state: *mut c_void,
+) -> JsValueRef { print_callback_impl(args, argc, state) }
+
+unsafe fn print_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_void) -> JsValueRef {
+    if state.is_null() { return ptr::null_mut(); }
+    let s = &*(state as *const PrintCallbackState);
+    let api = &*s.api;
+    let text = collect_args_as_string(api, args, argc, 1, " ");
+    println!("{}", text);
+    get_undefined(api)
 }
 
-unsafe fn print_callback_impl(
-    arguments: *mut JsValueRef,
-    argument_count: u16,
-    callback_state: *mut c_void,
-) -> JsValueRef {
-    if callback_state.is_null() {
-        return ptr::null_mut();
-    }
+// ─── console.* native callback ───────────────────────────────────────────────
 
-    let state = &*(callback_state as *const PrintCallbackState);
-    let api = &*state.api;
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn console_callback(
+    _: JsValueRef, _: bool, args: *mut JsValueRef, argc: u16, state: *mut c_void,
+) -> JsValueRef { console_callback_impl(args, argc, state) }
 
-    let mut output = String::new();
-    for i in 1..(argument_count as usize) {
-        let value = *arguments.add(i);
-        match value_to_string(api, value) {
-            Ok(text) => {
-                if !output.is_empty() {
-                    output.push(' ');
-                }
-                output.push_str(&text);
-            }
-            Err(err) => {
-                if !output.is_empty() {
-                    output.push(' ');
-                }
-                let _ = write!(output, "<toString failed: {}>", err);
+#[cfg(not(target_os = "windows"))]
+unsafe extern "C" fn console_callback(
+    _: JsValueRef, _: bool, args: *mut JsValueRef, argc: u16, state: *mut c_void,
+) -> JsValueRef { console_callback_impl(args, argc, state) }
+
+const CONSOLE_CB: JsNativeFunction = Some(console_callback);
+
+unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_void) -> JsValueRef {
+    if state.is_null() { return ptr::null_mut(); }
+    let s     = &*(state as *const ConsoleCallbackStateEx);
+    let api   = &*s.api;
+    let shared = &mut *s.shared;
+    let indent = shared.indent();
+
+    match s.kind {
+        // ── log / info / debug ───────────────────────────────────────────────
+        ConsoleMethodKind::Log | ConsoleMethodKind::Info | ConsoleMethodKind::Debug => {
+            let text = collect_args_as_string(api, args, argc, 1, " ");
+            println!("{}{}", indent, text);
+        }
+
+        // ── warn ─────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Warn => {
+            let text = collect_args_as_string(api, args, argc, 1, " ");
+            eprintln!("{}\x1b[33m[warn]\x1b[0m {}", indent, text);
+        }
+
+        // ── error ─────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Error => {
+            let text = collect_args_as_string(api, args, argc, 1, " ");
+            eprintln!("{}\x1b[31m[error]\x1b[0m {}", indent, text);
+        }
+
+        // ── trace ─────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Trace => {
+            let text = if argc > 1 {
+                collect_args_as_string(api, args, argc, 1, " ")
+            } else {
+                "Trace".to_string()
+            };
+            eprintln!("{}\x1b[35m[trace]\x1b[0m {}", indent, text);
+            // A real stack trace would require JsGetStackTrace — print a note instead
+            eprintln!("{}  (stack trace not available in this host)", indent);
+        }
+
+        // ── assert ────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Assert => {
+            // First argument (index 1) is the condition; rest is the message
+            let condition = if argc > 1 {
+                is_truthy(api, *args.add(1))
+            } else {
+                false
+            };
+            if !condition {
+                let msg = if argc > 2 {
+                    collect_args_as_string(api, args, argc, 2, " ")
+                } else {
+                    "Assertion failed".to_string()
+                };
+                eprintln!("{}\x1b[31m[assert]\x1b[0m {}", indent, msg);
             }
         }
-    }
 
-    println!("{}", output);
-
-    let mut undefined = ptr::null_mut();
-    if (api.js_get_undefined_value)(&mut undefined) != JS_NO_ERROR {
-        return ptr::null_mut();
-    }
-
-    undefined
-}
-
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn console_callback_windows(
-    _callee: JsValueRef,
-    _is_construct_call: bool,
-    arguments: *mut JsValueRef,
-    argument_count: u16,
-    callback_state: *mut c_void,
-) -> JsValueRef {
-    console_callback_impl(arguments, argument_count, callback_state)
-}
-
-#[cfg(not(target_os = "windows"))]
-unsafe extern "C" fn console_callback_unix(
-    _callee: JsValueRef,
-    _is_construct_call: bool,
-    arguments: *mut JsValueRef,
-    argument_count: u16,
-    callback_state: *mut c_void,
-) -> JsValueRef {
-    console_callback_impl(arguments, argument_count, callback_state)
-}
-
-#[cfg(target_os = "windows")]
-const CONSOLE_CALLBACK: JsNativeFunction = Some(console_callback_windows);
-#[cfg(not(target_os = "windows"))]
-const CONSOLE_CALLBACK: JsNativeFunction = Some(console_callback_unix);
-
-unsafe fn console_callback_impl(
-    arguments: *mut JsValueRef,
-    argument_count: u16,
-    callback_state: *mut c_void,
-) -> JsValueRef {
-    if callback_state.is_null() {
-        return ptr::null_mut();
-    }
-
-    let state = &*(callback_state as *const ConsoleCallbackState);
-    let api = &*state.api;
-
-    let mut output = String::new();
-    let prefix = match state.kind {
-        ConsoleMethodKind::Log | ConsoleMethodKind::Info | ConsoleMethodKind::Debug | ConsoleMethodKind::Dir => "",
-        ConsoleMethodKind::Warn => "warn: ",
-        ConsoleMethodKind::Error => "error: ",
-    };
-    output.push_str(prefix);
-
-    match state.kind {
+        // ── dir ───────────────────────────────────────────────────────────────
         ConsoleMethodKind::Dir => {
-            if argument_count > 1 {
-                match value_to_string(api, *arguments.add(1)) {
-                    Ok(text) => output.push_str(&text),
-                    Err(err) => {
-                        let _ = write!(output, "<toString failed: {}>", err);
-                    }
-                }
+            if argc > 1 {
+                let text = value_to_string(api, *args.add(1)).unwrap_or_else(|e| format!("<{}>", e));
+                println!("{}{}", indent, text);
             }
         }
-        _ => {
-            for i in 1..(argument_count as usize) {
-                let value = *arguments.add(i);
-                match value_to_string(api, value) {
-                    Ok(text) => {
-                        if !output.is_empty() && !output.ends_with(' ') {
-                            output.push(' ');
-                        }
-                        output.push_str(&text);
-                    }
-                    Err(err) => {
-                        if !output.is_empty() && !output.ends_with(' ') {
-                            output.push(' ');
-                        }
-                        let _ = write!(output, "<toString failed: {}>", err);
-                    }
-                }
+
+        // ── table ─────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Table => {
+            // Best-effort: stringify the value and print it
+            if argc > 1 {
+                let text = value_to_string(api, *args.add(1)).unwrap_or_else(|e| format!("<{}>", e));
+                println!("{}\x1b[1m[table]\x1b[0m {}", indent, text);
             }
+        }
+
+        // ── count ─────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Count => {
+            let label = if argc > 1 {
+                value_to_string(api, *args.add(1)).unwrap_or_else(|_| "default".to_string())
+            } else {
+                "default".to_string()
+            };
+            let entry = shared.counters.entry(label.clone()).or_insert(0);
+            *entry += 1;
+            println!("{}{}: {}", indent, label, *entry);
+        }
+
+        ConsoleMethodKind::CountReset => {
+            let label = if argc > 1 {
+                value_to_string(api, *args.add(1)).unwrap_or_else(|_| "default".to_string())
+            } else {
+                "default".to_string()
+            };
+            shared.counters.insert(label.clone(), 0);
+            println!("{}{}: 0", indent, label);
+        }
+
+        // ── time ──────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Time => {
+            let label = if argc > 1 {
+                value_to_string(api, *args.add(1)).unwrap_or_else(|_| "default".to_string())
+            } else {
+                "default".to_string()
+            };
+            shared.timers.insert(label, Instant::now());
+        }
+
+        ConsoleMethodKind::TimeEnd => {
+            let label = if argc > 1 {
+                value_to_string(api, *args.add(1)).unwrap_or_else(|_| "default".to_string())
+            } else {
+                "default".to_string()
+            };
+            if let Some(start) = shared.timers.remove(&label) {
+                let elapsed = start.elapsed();
+                println!("{}{}: {:.3}ms", indent, label, elapsed.as_secs_f64() * 1000.0);
+            } else {
+                eprintln!("{}\x1b[33m[timer]\x1b[0m No such timer: '{}'", indent, label);
+            }
+        }
+
+        ConsoleMethodKind::TimeLog => {
+            let label = if argc > 1 {
+                value_to_string(api, *args.add(1)).unwrap_or_else(|_| "default".to_string())
+            } else {
+                "default".to_string()
+            };
+            if let Some(start) = shared.timers.get(&label) {
+                let elapsed = start.elapsed();
+                println!("{}{}: {:.3}ms", indent, label, elapsed.as_secs_f64() * 1000.0);
+            } else {
+                eprintln!("{}\x1b[33m[timer]\x1b[0m No such timer: '{}'", indent, label);
+            }
+        }
+
+        // ── group ─────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Group => {
+            let label = if argc > 1 {
+                collect_args_as_string(api, args, argc, 1, " ")
+            } else {
+                String::new()
+            };
+            if !label.is_empty() {
+                println!("{}\x1b[1m{}\x1b[0m", indent, label);
+            }
+            shared.group_depth += 1;
+        }
+
+        ConsoleMethodKind::GroupEnd => {
+            if shared.group_depth > 0 {
+                shared.group_depth -= 1;
+            }
+        }
+
+        // ── clear ─────────────────────────────────────────────────────────────
+        ConsoleMethodKind::Clear => {
+            // ANSI clear screen + move cursor to top
+            print!("\x1b[2J\x1b[H");
         }
     }
 
-    match state.kind {
-        ConsoleMethodKind::Warn | ConsoleMethodKind::Error => eprintln!("{}", output),
-        _ => println!("{}", output),
-    }
-
-    let mut undefined = ptr::null_mut();
-    if (api.js_get_undefined_value)(&mut undefined) != JS_NO_ERROR {
-        return ptr::null_mut();
-    }
-
-    undefined
+    get_undefined(api)
 }
+
+// ─── Helpers called from callbacks ───────────────────────────────────────────
+
+/// Collect arguments [start_idx..argc) into a single string, joined by sep.
+unsafe fn collect_args_as_string(
+    api: &ChakraApi,
+    args: *mut JsValueRef,
+    argc: u16,
+    start_idx: usize,
+    sep: &str,
+) -> String {
+    let mut out = String::new();
+    for i in start_idx..(argc as usize) {
+        if !out.is_empty() { out.push_str(sep); }
+        match value_to_string(api, *args.add(i)) {
+            Ok(s)  => out.push_str(&s),
+            Err(e) => { let _ = write!(out, "<toString failed: {}>", e); }
+        }
+    }
+    out
+}
+
+/// Return the JS undefined value, or null on error.
+unsafe fn get_undefined(api: &ChakraApi) -> JsValueRef {
+    let mut v = ptr::null_mut();
+    (api.js_get_undefined_value)(&mut v);
+    v
+}
+
+/// Cheap truthiness check — if JsGetValueType fails we treat it as falsy.
+unsafe fn is_truthy(api: &ChakraApi, value: JsValueRef) -> bool {
+    // Simplest approach: convert to string and check
+    match value_to_string(api, value) {
+        Ok(s) => !matches!(s.as_str(), "false" | "0" | "" | "null" | "undefined" | "NaN"),
+        Err(_) => false,
+    }
+}
+
+// ─── ChakraApi::load ─────────────────────────────────────────────────────────
 
 impl ChakraApi {
     fn load(path_hint: Option<&Path>) -> Result<Self, String> {
         let candidates = chakra_library_candidates(path_hint);
-
         let mut last_error = String::new();
         for candidate in &candidates {
-            let result = unsafe { Library::new(candidate) };
-            match result {
-                Ok(library) => {
-                    return unsafe { Self::from_library(library) };
-                }
-                Err(err) => {
-                    last_error = format!("{}: {}", candidate.display(), err);
-                }
+            match unsafe { Library::new(candidate) } {
+                Ok(lib) => return unsafe { Self::from_library(lib) },
+                Err(e)  => last_error = format!("{}: {}", candidate.display(), e),
             }
         }
-
         if candidates.is_empty() {
-            Err("No ChakraCore shared library candidates found.".to_string())
+            Err("No ChakraCore shared library candidates found.".into())
         } else {
-            Err(format!(
-                "Unable to load ChakraCore shared library. Last error: {}",
-                last_error
-            ))
+            Err(format!("Unable to load ChakraCore shared library. Last error: {}", last_error))
         }
     }
 
     unsafe fn from_library(library: Library) -> Result<Self, String> {
-        unsafe fn get_required<T: Copy>(library: &Library, symbol: &[u8]) -> Result<T, String> {
-            let loaded: Symbol<T> = library
-                .get(symbol)
-                .map_err(|e| format!("Missing symbol {}: {}", String::from_utf8_lossy(symbol), e))?;
-            Ok(*loaded)
+        macro_rules! req {
+            ($sym:literal as $ty:ty) => {{
+                let s: Symbol<$ty> = library.get($sym)
+                    .map_err(|e| format!("Missing symbol {}: {}", String::from_utf8_lossy($sym), e))?;
+                *s
+            }};
         }
-
-        unsafe fn get_optional<T: Copy>(library: &Library, symbol: &[u8]) -> Option<T> {
-            match library.get::<T>(symbol) {
-                Ok(loaded) => Some(*loaded),
-                Err(_) => None,
-            }
+        macro_rules! opt {
+            ($sym:literal as $ty:ty) => {
+                library.get::<$ty>($sym).ok().map(|s| *s)
+            };
         }
-
-        let js_create_runtime = get_required::<JsCreateRuntimeFn>(&library, b"JsCreateRuntime")?;
-        let js_dispose_runtime = get_required::<JsDisposeRuntimeFn>(&library, b"JsDisposeRuntime")?;
-        let js_create_context = get_required::<JsCreateContextFn>(&library, b"JsCreateContext")?;
-        let js_set_current_context =
-            get_required::<JsSetCurrentContextFn>(&library, b"JsSetCurrentContext")?;
-        let js_create_string = get_required::<JsCreateStringFn>(&library, b"JsCreateString")?;
-        let js_run = get_required::<JsRunFn>(&library, b"JsRun")?;
-        let js_get_and_clear_exception =
-            get_required::<JsGetAndClearExceptionFn>(&library, b"JsGetAndClearException")?;
-        let js_convert_value_to_string =
-            get_required::<JsConvertValueToStringFn>(&library, b"JsConvertValueToString")?;
-        let js_copy_string = get_required::<JsCopyStringFn>(&library, b"JsCopyString")?;
-        let js_get_global_object =
-            get_required::<JsGetGlobalObjectFn>(&library, b"JsGetGlobalObject")?;
-        let js_create_function =
-            get_required::<JsCreateFunctionFn>(&library, b"JsCreateFunction")?;
-        let js_create_object = get_required::<JsCreateObjectFn>(&library, b"JsCreateObject")?;
-        let js_create_property_id =
-            get_required::<JsCreatePropertyIdFn>(&library, b"JsCreatePropertyId")?;
-        let js_set_property = get_required::<JsSetPropertyFn>(&library, b"JsSetProperty")?;
-        let js_get_undefined_value =
-            get_required::<JsGetUndefinedValueFn>(&library, b"JsGetUndefinedValue")?;
-        let js_get_value_type = get_required::<JsGetValueTypeFn>(&library, b"JsGetValueType")?;
-
-        let js_install_chakra_system_require =
-            get_optional::<JsInstallChakraSystemRequireFn>(&library, b"JsInstallChakraSystemRequire");
-        let js_chakra_es2021_transform =
-            get_optional::<JsChakraEs2021TransformFn>(&library, b"JsChakraEs2021Transform");
 
         Ok(Self {
+            js_create_runtime:          req!(b"JsCreateRuntime"          as JsCreateRuntimeFn),
+            js_dispose_runtime:         req!(b"JsDisposeRuntime"         as JsDisposeRuntimeFn),
+            js_create_context:          req!(b"JsCreateContext"          as JsCreateContextFn),
+            js_set_current_context:     req!(b"JsSetCurrentContext"      as JsSetCurrentContextFn),
+            js_create_string:           req!(b"JsCreateString"           as JsCreateStringFn),
+            js_run:                     req!(b"JsRun"                    as JsRunFn),
+            js_get_and_clear_exception: req!(b"JsGetAndClearException"   as JsGetAndClearExceptionFn),
+            js_convert_value_to_string: req!(b"JsConvertValueToString"   as JsConvertValueToStringFn),
+            js_copy_string:             req!(b"JsCopyString"             as JsCopyStringFn),
+            js_get_global_object:       req!(b"JsGetGlobalObject"        as JsGetGlobalObjectFn),
+            js_create_function:         req!(b"JsCreateFunction"         as JsCreateFunctionFn),
+            js_create_object:           req!(b"JsCreateObject"           as JsCreateObjectFn),
+            js_create_property_id:      req!(b"JsCreatePropertyId"       as JsCreatePropertyIdFn),
+            js_set_property:            req!(b"JsSetProperty"            as JsSetPropertyFn),
+            js_get_undefined_value:     req!(b"JsGetUndefinedValue"      as JsGetUndefinedValueFn),
+            js_get_value_type:          req!(b"JsGetValueType"           as JsGetValueTypeFn),
+            js_install_chakra_system_require:
+                                        opt!(b"JsInstallChakraSystemRequire" as JsInstallChakraSystemRequireFn),
+            js_chakra_es2021_transform: opt!(b"JsChakraEs2021Transform"  as JsChakraEs2021TransformFn),
             _library: library,
-            js_create_runtime,
-            js_dispose_runtime,
-            js_create_context,
-            js_set_current_context,
-            js_create_string,
-            js_run,
-            js_get_and_clear_exception,
-            js_convert_value_to_string,
-            js_copy_string,
-            js_get_global_object,
-            js_create_function,
-            js_create_object,
-            js_create_property_id,
-            js_set_property,
-            js_get_undefined_value,
-            js_get_value_type,
-            js_install_chakra_system_require,
-            js_chakra_es2021_transform,
         })
     }
 }
 
+// ─── HostRuntime impl ────────────────────────────────────────────────────────
+
 impl HostRuntime {
-    fn create(chakra_library_hint: Option<&Path>) -> Result<Self, String> {
+    /// Returns a `Box<HostRuntime>` (heap-pinned) so that the raw `*const ChakraApi`
+    /// pointers stored in every callback state struct never go stale.
+    ///
+    /// Root cause of the original crash:
+    ///   `PrintCallbackState { api: &api }` was created before `api` was moved into
+    ///   the `HostRuntime` struct, and then again the struct itself was moved when
+    ///   returned from `create()`.  Each move invalidated the raw pointer, so the
+    ///   first `print()` / `console.log()` dereference caused STATUS_ACCESS_VIOLATION.
+    ///
+    /// Fix: build a `Box<HostRuntime>` with placeholder states, then — while the
+    /// heap address is stable — overwrite the states with pointers derived from
+    /// `&host.api` and `&host.console_shared`, which will never move again.
+    fn create(chakra_library_hint: Option<&Path>) -> Result<Box<Self>, String> {
         let api = ChakraApi::load(chakra_library_hint)?;
 
         let mut runtime = ptr::null_mut();
-        let create_runtime = unsafe {
-            (api.js_create_runtime)(
-                JS_RUNTIME_ATTRIBUTE_NONE,
-                ptr::null_mut(),
-                &mut runtime as *mut JsRuntimeHandle,
-            )
-        };
-        ensure_js_ok(create_runtime, "JsCreateRuntime")?;
+        ensure_js_ok(
+            unsafe { (api.js_create_runtime)(JS_RUNTIME_ATTRIBUTE_NONE, ptr::null_mut(), &mut runtime) },
+            "JsCreateRuntime",
+        )?;
 
         let mut context = ptr::null_mut();
-        let create_context = unsafe { (api.js_create_context)(runtime, &mut context as *mut JsContextRef) };
-        if create_context != JS_NO_ERROR {
-            unsafe {
-                (api.js_dispose_runtime)(runtime);
-            }
-            return Err(format_js_error("JsCreateContext", create_context));
+        if unsafe { (api.js_create_context)(runtime, &mut context) } != JS_NO_ERROR {
+            unsafe { (api.js_dispose_runtime)(runtime); }
+            return Err("JsCreateContext failed".into());
+        }
+        if unsafe { (api.js_set_current_context)(context) } != JS_NO_ERROR {
+            unsafe { (api.js_dispose_runtime)(runtime); }
+            return Err("JsSetCurrentContext failed".into());
         }
 
-        let set_context = unsafe { (api.js_set_current_context)(context) };
-        if set_context != JS_NO_ERROR {
-            unsafe {
-                (api.js_dispose_runtime)(runtime);
-            }
-            return Err(format_js_error("JsSetCurrentContext", set_context));
-        }
-
-        let print_callback_state = Box::new(PrintCallbackState {
-            api: &api as *const ChakraApi,
-        });
-
-        let mut host = Self {
+        // ── Step 1: allocate on the heap with placeholder (null) api pointers.
+        //    From this point on `host` will NOT move — all &-borrows below are
+        //    into stable heap memory.
+        let mut host = Box::new(Self {
             api,
             runtime,
-            print_callback_state,
-            console_callback_states: Vec::new(),
-        };
+            // Placeholder — real pointer patched in step 2.
+            _print_state: Box::new(PrintCallbackState { api: ptr::null() }),
+            _console_states: Vec::new(),
+            console_shared: Box::new(ConsoleSharedState::new()),
+        });
 
-        host.install_print()?;
-        host.install_console()?;
+        // ── Step 2: now that `host` is at a fixed heap address, capture stable
+        //    raw pointers to its fields and patch the states.
+        let api_ptr: *const ChakraApi      = &host.api;
+        let shared_ptr: *mut ConsoleSharedState = host.console_shared.as_mut();
+
+        host._print_state = Box::new(PrintCallbackState { api: api_ptr });
+
+        // ── Step 3: install globals (uses the already-stable api_ptr / shared_ptr).
+        host.install_print_with(api_ptr)?;
+        host.install_console_with(api_ptr, shared_ptr)?;
         host.try_install_chakra_system_require();
 
         Ok(host)
     }
 
-    fn run_script_file(&self, script_path: &Path) -> Result<(), String> {
-        let script_source = fs::read_to_string(script_path)
-            .map_err(|e| format!("Failed to read script {}: {}", script_path.display(), e))?;
+    // ── script execution ─────────────────────────────────────────────────────
 
-        let source_label = script_path
-            .to_str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| script_path.display().to_string());
-
-        self.run_script_source(&script_source, &source_label)?;
+    fn run_script_file(&self, path: &Path) -> Result<(), String> {
+        let source = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
+        let label = path.to_string_lossy().into_owned();
+        self.run_script_source(&source, &label)?;
         Ok(())
     }
 
-    fn run_script_source(&self, source_text: &str, source_label: &str) -> Result<JsValueRef, String> {
-        let runtime_script_source = self.maybe_transform_entry_source(source_text);
-        let script_value = self.create_js_string(&runtime_script_source)?;
-        let source_url = self.create_js_string(source_label)?;
+    fn run_script_source(&self, source: &str, label: &str) -> Result<JsValueRef, String> {
+        let transformed = self.maybe_transform_entry_source(source);
+        let script_val  = self.create_js_string(&transformed)?;
+        let label_val   = self.create_js_string(label)?;
 
-        let mut result_value = ptr::null_mut();
-        let run_result = unsafe {
-            (self.api.js_run)(
-                script_value,
-                0,
-                source_url,
-                JS_PARSE_SCRIPT_ATTRIBUTE_NONE,
-                &mut result_value as *mut JsValueRef,
-            )
+        let mut result = ptr::null_mut();
+        let rc = unsafe {
+            (self.api.js_run)(script_val, 0, label_val, JS_PARSE_SCRIPT_ATTRIBUTE_NONE, &mut result)
         };
-
-        if run_result != JS_NO_ERROR {
-            return Err(self.report_script_failure("JsRun", run_result).unwrap_err());
+        if rc != JS_NO_ERROR {
+            return Err(self.report_script_failure("JsRun", rc).unwrap_err());
         }
-
-        Ok(result_value)
+        Ok(result)
     }
 
-    fn maybe_transform_entry_source(&self, source_text: &str) -> String {
-        if !should_try_es2021_transform(source_text) {
-            return source_text.to_string();
+    fn maybe_transform_entry_source(&self, source: &str) -> String {
+        if !should_try_es2021_transform(source) { return source.into(); }
+        let Some(tfn) = self.api.js_chakra_es2021_transform else { return source.into(); };
+        let Ok(sv) = self.create_js_string(source) else { return source.into(); };
+        let mut out = ptr::null_mut();
+        let rc = unsafe { tfn(sv, &mut out) };
+        if rc != JS_NO_ERROR {
+            eprintln!("warning: ES2021 transform failed, running original source.");
+            return source.into();
         }
-
-        let Some(transform_fn) = self.api.js_chakra_es2021_transform else {
-            return source_text.to_string();
-        };
-
-        let source_value = match self.create_js_string(source_text) {
-            Ok(value) => value,
-            Err(_) => return source_text.to_string(),
-        };
-
-        let mut transformed_value = ptr::null_mut();
-        let transform_result = unsafe {
-            transform_fn(source_value, &mut transformed_value as *mut JsValueRef)
-        };
-
-        if transform_result != JS_NO_ERROR {
-            eprintln!(
-                "warning: ES2021 transform failed, running original source: {}",
-                self.describe_current_exception()
-                    .unwrap_or_else(|| format_js_error("JsChakraEs2021Transform", transform_result))
-            );
-            return source_text.to_string();
-        }
-
-        match value_to_string(&self.api, transformed_value) {
-            Ok(transformed_text) if !transformed_text.is_empty() => transformed_text,
-            _ => source_text.to_string(),
+        match value_to_string(&self.api, out) {
+            Ok(s) if !s.is_empty() => s,
+            _ => source.into(),
         }
     }
 
-    fn install_print(&mut self) -> Result<(), String> {
-        let mut global = ptr::null_mut();
-        let get_global = unsafe { (self.api.js_get_global_object)(&mut global as *mut JsValueRef) };
-        ensure_js_ok(get_global, "JsGetGlobalObject")?;
+    // ── global function installers ───────────────────────────────────────────
+    // Both methods receive raw pointers captured *after* HostRuntime was
+    // heap-allocated in `create()`.  That guarantees they stay valid for the
+    // entire lifetime of the host — no move can invalidate them.
 
-        let mut print_function = ptr::null_mut();
-        let create_function = unsafe {
+    fn install_print_with(&mut self, api_ptr: *const ChakraApi) -> Result<(), String> {
+        self._print_state.api = api_ptr;
+        let global = self.get_global()?;
+        let mut f = ptr::null_mut();
+        ensure_js_ok(unsafe {
             (self.api.js_create_function)(
                 Some(print_callback),
-                self.print_callback_state.as_mut() as *mut PrintCallbackState as *mut c_void,
-                &mut print_function as *mut JsValueRef,
+                self._print_state.as_mut() as *mut PrintCallbackState as *mut c_void,
+                &mut f,
             )
-        };
-        ensure_js_ok(create_function, "JsCreateFunction(print)")?;
-
-        let property_id = self.create_property_id("print")?;
-        let set_property = unsafe {
-            (self.api.js_set_property)(
-                global,
-                property_id,
-                print_function,
-                true,
-            )
-        };
-
-        ensure_js_ok(set_property, "JsSetProperty(global.print)")
+        }, "JsCreateFunction(print)")?;
+        self.set_property_on(global, "print", f)
     }
 
-    fn install_console(&mut self) -> Result<(), String> {
-        let mut global = ptr::null_mut();
-        let get_global = unsafe { (self.api.js_get_global_object)(&mut global as *mut JsValueRef) };
-        ensure_js_ok(get_global, "JsGetGlobalObject")?;
+    fn install_console_with(
+        &mut self,
+        api_ptr: *const ChakraApi,
+        shared_ptr: *mut ConsoleSharedState,
+    ) -> Result<(), String> {
+        let global = self.get_global()?;
+        let mut obj = ptr::null_mut();
+        ensure_js_ok(
+            unsafe { (self.api.js_create_object)(&mut obj) },
+            "JsCreateObject(console)",
+        )?;
 
-        let mut console_object = ptr::null_mut();
-        let create_object = unsafe { (self.api.js_create_object)(&mut console_object as *mut JsValueRef) };
-        ensure_js_ok(create_object, "JsCreateObject(console)")?;
-
-        let console_methods = [
-            ("log", ConsoleMethodKind::Log),
-            ("info", ConsoleMethodKind::Info),
-            ("warn", ConsoleMethodKind::Warn),
-            ("error", ConsoleMethodKind::Error),
-            ("debug", ConsoleMethodKind::Debug),
-            ("dir", ConsoleMethodKind::Dir),
+        let methods: &[(&str, ConsoleMethodKind)] = &[
+            ("log",            ConsoleMethodKind::Log),
+            ("info",           ConsoleMethodKind::Info),
+            ("warn",           ConsoleMethodKind::Warn),
+            ("error",          ConsoleMethodKind::Error),
+            ("debug",          ConsoleMethodKind::Debug),
+            ("dir",            ConsoleMethodKind::Dir),
+            ("trace",          ConsoleMethodKind::Trace),
+            ("assert",         ConsoleMethodKind::Assert),
+            ("table",          ConsoleMethodKind::Table),
+            ("count",          ConsoleMethodKind::Count),
+            ("countReset",     ConsoleMethodKind::CountReset),
+            ("time",           ConsoleMethodKind::Time),
+            ("timeEnd",        ConsoleMethodKind::TimeEnd),
+            ("timeLog",        ConsoleMethodKind::TimeLog),
+            ("group",          ConsoleMethodKind::Group),
+            ("groupCollapsed", ConsoleMethodKind::Group),
+            ("groupEnd",       ConsoleMethodKind::GroupEnd),
+            ("clear",          ConsoleMethodKind::Clear),
         ];
 
-        for (method_name, method_kind) in console_methods {
-            let callback_state = Box::new(ConsoleCallbackState {
-                api: &self.api as *const ChakraApi,
-                kind: method_kind,
+        for &(name, kind) in methods {
+            let state = Box::new(ConsoleCallbackStateEx {
+                api: api_ptr,
+                kind,
+                shared: shared_ptr,
             });
-            let callback_state_ptr = callback_state.as_ref() as *const ConsoleCallbackState as *mut c_void;
-            self.console_callback_states.push(callback_state);
+            let cb_ptr = state.as_ref() as *const ConsoleCallbackStateEx as *mut c_void;
+            self._console_states.push(state);
 
-            let mut method_function = ptr::null_mut();
-            let create_function = unsafe {
-                (self.api.js_create_function)(
-                    CONSOLE_CALLBACK,
-                    callback_state_ptr,
-                    &mut method_function as *mut JsValueRef,
-                )
-            };
-            ensure_js_ok(create_function, &format!("JsCreateFunction(console.{})", method_name))?;
-
-            let property_id = self.create_property_id(method_name)?;
-            let set_property = unsafe {
-                (self.api.js_set_property)(console_object, property_id, method_function, true)
-            };
-            ensure_js_ok(set_property, &format!("JsSetProperty(console.{})", method_name))?;
+            let mut f = ptr::null_mut();
+            ensure_js_ok(
+                unsafe { (self.api.js_create_function)(CONSOLE_CB, cb_ptr, &mut f) },
+                &format!("JsCreateFunction(console.{})", name),
+            )?;
+            self.set_property_on(obj, name, f)?;
         }
 
-        let console_property = self.create_property_id("console")?;
-        let set_global_console = unsafe {
-            (self.api.js_set_property)(global, console_property, console_object, true)
-        };
-        ensure_js_ok(set_global_console, "JsSetProperty(global.console)")
+        self.set_property_on(global, "console", obj)
     }
 
     fn try_install_chakra_system_require(&self) {
-        let Some(install_require) = self.api.js_install_chakra_system_require else {
-            eprintln!("warning: JsInstallChakraSystemRequire is unavailable in this ChakraCore build");
+        let Some(install) = self.api.js_install_chakra_system_require else {
+            eprintln!("warning: JsInstallChakraSystemRequire not available in this build");
             return;
         };
-
-        let mut require_function = ptr::null_mut();
-        let install_result = unsafe { install_require(&mut require_function as *mut JsValueRef) };
-        if install_result != JS_NO_ERROR {
-            eprintln!(
-                "warning: failed to install chakra system require: {}",
+        let mut f = ptr::null_mut();
+        let rc = unsafe { install(&mut f) };
+        if rc != JS_NO_ERROR {
+            eprintln!("warning: JsInstallChakraSystemRequire failed: {}",
                 self.describe_current_exception()
-                    .unwrap_or_else(|| format_js_error("JsInstallChakraSystemRequire", install_result))
-            );
+                    .unwrap_or_else(|| format_js_error("JsInstallChakraSystemRequire", rc)));
         }
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn get_global(&self) -> Result<JsValueRef, String> {
+        let mut g = ptr::null_mut();
+        ensure_js_ok(unsafe { (self.api.js_get_global_object)(&mut g) }, "JsGetGlobalObject")?;
+        Ok(g)
+    }
+
+    fn set_property_on(&self, obj: JsValueRef, name: &str, value: JsValueRef) -> Result<(), String> {
+        let pid = self.create_property_id(name)?;
+        ensure_js_ok(
+            unsafe { (self.api.js_set_property)(obj, pid, value, true) },
+            &format!("JsSetProperty({})", name),
+        )
     }
 
     fn create_js_string(&self, text: &str) -> Result<JsValueRef, String> {
-        let mut value = ptr::null_mut();
-        let create_string = unsafe {
-            (self.api.js_create_string)(
-                text.as_ptr(),
-                text.len(),
-                &mut value as *mut JsValueRef,
-            )
-        };
-        ensure_js_ok(create_string, "JsCreateString")?;
-        Ok(value)
+        let mut v = ptr::null_mut();
+        ensure_js_ok(
+            unsafe { (self.api.js_create_string)(text.as_ptr(), text.len(), &mut v) },
+            "JsCreateString",
+        )?;
+        Ok(v)
     }
 
     fn create_property_id(&self, name: &str) -> Result<JsPropertyIdRef, String> {
-        let mut property_id = ptr::null_mut();
-        let create_property_id = unsafe {
-            (self.api.js_create_property_id)(
-                name.as_ptr(),
-                name.len(),
-                &mut property_id as *mut JsPropertyIdRef,
-            )
-        };
-        ensure_js_ok(create_property_id, "JsCreatePropertyId")?;
-        Ok(property_id)
+        let mut pid = ptr::null_mut();
+        ensure_js_ok(
+            unsafe { (self.api.js_create_property_id)(name.as_ptr(), name.len(), &mut pid) },
+            "JsCreatePropertyId",
+        )?;
+        Ok(pid)
     }
 
-    fn report_script_failure(&self, operation: &str, error_code: JsErrorCode) -> Result<(), String> {
-        let exception_text = self.describe_current_exception();
-
-        if let Some(text) = exception_text {
-            Err(format!(
-                "{} failed with {}\nJavaScript exception: {}",
-                operation,
-                error_name(error_code),
-                text
-            ))
+    fn report_script_failure(&self, op: &str, code: JsErrorCode) -> Result<(), String> {
+        Err(if let Some(msg) = self.describe_current_exception() {
+            format!("{} failed ({})\nJavaScript exception: {}", op, error_name(code), msg)
         } else {
-            Err(format_js_error(operation, error_code))
-        }
+            format_js_error(op, code)
+        })
     }
 
     fn describe_current_exception(&self) -> Option<String> {
-        let mut exception: JsValueRef = ptr::null_mut();
-        let error_code = unsafe {
-            (self.api.js_get_and_clear_exception)(&mut exception as *mut JsValueRef)
-        };
-
-        if error_code != JS_NO_ERROR || exception.is_null() {
-            return None;
-        }
-
-        value_to_string(&self.api, exception).ok()
+        let mut ex = ptr::null_mut();
+        let rc = unsafe { (self.api.js_get_and_clear_exception)(&mut ex) };
+        if rc != JS_NO_ERROR || ex.is_null() { return None; }
+        value_to_string(&self.api, ex).ok()
     }
 
+    // ── REPL ─────────────────────────────────────────────────────────────────
+
     fn run_repl(&self) -> Result<(), String> {
-        let helper = ReplHelper {
-            keywords: JS_KEYWORDS,
-        };
-
+        let helper = ReplHelper { keywords: JS_KEYWORDS };
         let mut editor: Editor<ReplHelper, rustyline::history::DefaultHistory> =
-            Editor::new().map_err(|e| format!("Failed to initialize interactive editor: {}", e))?;
+            Editor::new().map_err(|e| format!("Editor init failed: {}", e))?;
         editor.set_helper(Some(helper));
-        let _ = editor.load_history(".chakra_runtime_history");
+        let _ = editor.load_history(".chakra_history");
 
-        println!("ChakraCore Rust runtime REPL");
-        println!("Type .exit or press Ctrl-D to quit.");
+        println!("\x1b[1;36mChakraCore REPL\x1b[0m");
+        println!("Type \x1b[1m.help\x1b[0m for available commands, \x1b[1m.exit\x1b[0m or Ctrl-D to quit.\n");
+
+        // Unique monotonic source context
+        static CTX: AtomicUsize = AtomicUsize::new(1);
 
         let mut buffer = String::new();
+
         loop {
-            let prompt = if buffer.is_empty() { "chakra> " } else { "...> " };
+            let prompt = if buffer.is_empty() { "chakra> " } else { "  ...> " };
             match editor.readline(prompt) {
                 Ok(line) => {
                     let trimmed = line.trim();
-                    if buffer.is_empty() && (trimmed == ".exit" || trimmed == ".quit") {
-                        break;
+
+                    // ── REPL dot-commands ──────────────────────────────────
+                    if buffer.is_empty() && trimmed.starts_with('.') {
+                        match self.handle_repl_command(trimmed, &mut editor) {
+                            ReplCommand::Exit     => break,
+                            ReplCommand::Handled  => continue,
+                            ReplCommand::Unknown  => {
+                                eprintln!("\x1b[33mUnknown command: {}\x1b[0m  (try .help)", trimmed);
+                                continue;
+                            }
+                        }
                     }
 
-                    if buffer.is_empty() && trimmed.is_empty() {
-                        continue;
-                    }
+                    if buffer.is_empty() && trimmed.is_empty() { continue; }
 
                     buffer.push_str(&line);
                     buffer.push('\n');
 
-                    if js_source_needs_more_input(&buffer) {
-                        continue;
-                    }
+                    if js_source_needs_more_input(&buffer) { continue; }
 
                     let submitted = buffer.trim_end().to_string();
-                    if submitted.is_empty() {
-                        buffer.clear();
-                        continue;
-                    }
+                    buffer.clear();
+                    if submitted.is_empty() { continue; }
 
-                    let _ = editor.add_history_entry(submitted.as_str());
-                    match self.run_script_source(&submitted, "<repl>") {
-                        Ok(result_value) => {
-                            if !is_undefined_value(&self.api, result_value) {
-                                match value_to_string(&self.api, result_value) {
-                                    Ok(text) if !text.is_empty() => println!("\x1b[1;36m{}\x1b[0m", text),
-                                    Ok(_) => {}
-                                    Err(err) => eprintln!("repl result conversion failed: {}", err),
+                    let _ = editor.add_history_entry(&submitted);
+
+                    let ctx_id = CTX.fetch_add(1, Ordering::Relaxed);
+                    let label  = format!("<repl:{}>", ctx_id);
+
+                    match self.run_script_source(&submitted, &label) {
+                        Ok(result) => {
+                            if !is_undefined_value(&self.api, result) {
+                                match value_to_string(&self.api, result) {
+                                    Ok(s) if !s.is_empty() => println!("\x1b[1;36m{}\x1b[0m", s),
+                                    Ok(_)  => {}
+                                    Err(e) => eprintln!("result error: {}", e),
                                 }
                             }
                         }
-                        Err(err) => eprintln!("{}", err),
+                        Err(e) => eprintln!("\x1b[31m{}\x1b[0m", e),
                     }
-
-                    buffer.clear();
                 }
+
                 Err(ReadlineError::Interrupted) => {
                     println!("^C");
                     buffer.clear();
                 }
                 Err(ReadlineError::Eof) => break,
-                Err(err) => return Err(format!("Interactive editor failed: {}", err)),
+                Err(e) => return Err(format!("Editor error: {}", e)),
             }
         }
 
-        let _ = editor.save_history(".chakra_runtime_history");
+        let _ = editor.save_history(".chakra_history");
+        println!("\x1b[2mBye!\x1b[0m");
         Ok(())
     }
+
+    fn handle_repl_command(
+        &self,
+        line: &str,
+        editor: &mut Editor<ReplHelper, rustyline::history::DefaultHistory>,
+    ) -> ReplCommand {
+        // Split into command word and optional argument
+        let (cmd, arg) = line.split_once(char::is_whitespace)
+            .map(|(c, a)| (c, a.trim()))
+            .unwrap_or((line, ""));
+
+        match cmd {
+            ".exit" | ".quit" => ReplCommand::Exit,
+
+            ".help" => {
+                println!("\x1b[1mAvailable REPL commands:\x1b[0m");
+                println!("  \x1b[1m.help\x1b[0m              Show this help");
+                println!("  \x1b[1m.exit\x1b[0m / \x1b[1m.quit\x1b[0m     Exit the REPL");
+                println!("  \x1b[1m.load <file>\x1b[0m       Load and execute a JavaScript file");
+                println!("  \x1b[1m.type <expr>\x1b[0m       Show the JS type of an expression");
+                println!("  \x1b[1m.clear\x1b[0m             Clear the screen");
+                println!("  \x1b[1m.history\x1b[0m           Show command history");
+                println!("  \x1b[1m.reset\x1b[0m             Print a reminder (runtime cannot be hot-reset)");
+                println!("  \x1b[1m.version\x1b[0m           Show runtime version info");
+                ReplCommand::Handled
+            }
+
+            ".load" => {
+                if arg.is_empty() {
+                    eprintln!("\x1b[33mUsage: .load <path/to/file.js>\x1b[0m");
+                    return ReplCommand::Handled;
+                }
+                let path = Path::new(arg);
+                match fs::read_to_string(path) {
+                    Err(e) => eprintln!("\x1b[31mFailed to read '{}': {}\x1b[0m", arg, e),
+                    Ok(source) => {
+                        println!("\x1b[2mLoading {}…\x1b[0m", arg);
+                        match self.run_script_source(&source, arg) {
+                            Ok(result) => {
+                                if !is_undefined_value(&self.api, result) {
+                                    if let Ok(s) = value_to_string(&self.api, result) {
+                                        if !s.is_empty() { println!("\x1b[1;36m{}\x1b[0m", s); }
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!("\x1b[31m{}\x1b[0m", e),
+                        }
+                    }
+                }
+                ReplCommand::Handled
+            }
+
+            ".type" => {
+                if arg.is_empty() {
+                    eprintln!("\x1b[33mUsage: .type <expression>\x1b[0m");
+                    return ReplCommand::Handled;
+                }
+                let snippet = format!("typeof ({})", arg);
+                match self.run_script_source(&snippet, "<type>") {
+                    Ok(v) => {
+                        let t = value_to_string(&self.api, v).unwrap_or_else(|_| "?".into());
+                        println!("\x1b[1;33m{}\x1b[0m", t);
+                    }
+                    Err(e) => eprintln!("\x1b[31m{}\x1b[0m", e),
+                }
+                ReplCommand::Handled
+            }
+
+            ".clear" => {
+                print!("\x1b[2J\x1b[H");
+                ReplCommand::Handled
+            }
+
+            ".history" => {
+                for (i, entry) in editor.history().iter().enumerate() {
+                    println!("  {:>4}  {}", i + 1, entry);
+                }
+                ReplCommand::Handled
+            }
+
+            ".reset" => {
+                eprintln!("\x1b[33mNote: live runtime reset is not supported. Restart the process to get a fresh context.\x1b[0m");
+                ReplCommand::Handled
+            }
+
+            ".version" => {
+                println!("chakra_runtime (Rust host)  built {}", env!("CARGO_PKG_VERSION"));
+                println!("ChakraCore shared library loaded dynamically");
+                ReplCommand::Handled
+            }
+
+            _ => ReplCommand::Unknown,
+        }
+    }
+}
+
+enum ReplCommand {
+    Exit,
+    Handled,
+    Unknown,
 }
 
 impl Drop for HostRuntime {
@@ -861,240 +925,161 @@ impl Drop for HostRuntime {
     }
 }
 
+// ─── Free helpers ─────────────────────────────────────────────────────────────
+
 fn value_to_string(api: &ChakraApi, value: JsValueRef) -> Result<String, String> {
-    let mut string_value = ptr::null_mut();
-    let convert_result = unsafe {
-        (api.js_convert_value_to_string)(value, &mut string_value as *mut JsValueRef)
-    };
-    ensure_js_ok(convert_result, "JsConvertValueToString")?;
+    let mut sv = ptr::null_mut();
+    ensure_js_ok(
+        unsafe { (api.js_convert_value_to_string)(value, &mut sv) },
+        "JsConvertValueToString",
+    )?;
 
-    let mut required_len: usize = 0;
-    let size_result = unsafe {
-        (api.js_copy_string)(
-            string_value,
-            ptr::null_mut(),
-            0,
-            &mut required_len as *mut usize,
-        )
-    };
-    ensure_js_ok(size_result, "JsCopyString(length)")?;
+    let mut len: usize = 0;
+    ensure_js_ok(
+        unsafe { (api.js_copy_string)(sv, ptr::null_mut(), 0, &mut len) },
+        "JsCopyString(len)",
+    )?;
+    if len == 0 { return Ok(String::new()); }
 
-    if required_len == 0 {
-        return Ok(String::new());
-    }
-
-    let mut buffer = vec![0u8; required_len];
-    let mut written_len: usize = 0;
-    let copy_result = unsafe {
-        (api.js_copy_string)(
-            string_value,
-            buffer.as_mut_ptr() as *mut i8,
-            buffer.len(),
-            &mut written_len as *mut usize,
-        )
-    };
-    ensure_js_ok(copy_result, "JsCopyString(data)")?;
-
-    buffer.truncate(written_len);
-    String::from_utf8(buffer)
-        .map_err(|e| format!("String conversion from UTF-8 failed: {}", e))
+    let mut buf = vec![0u8; len];
+    let mut written: usize = 0;
+    ensure_js_ok(
+        unsafe { (api.js_copy_string)(sv, buf.as_mut_ptr() as *mut i8, buf.len(), &mut written) },
+        "JsCopyString(data)",
+    )?;
+    buf.truncate(written);
+    String::from_utf8(buf).map_err(|e| format!("UTF-8 error: {}", e))
 }
 
 fn is_undefined_value(api: &ChakraApi, value: JsValueRef) -> bool {
-    let mut value_type = JS_VALUE_TYPE_UNDEFINED;
-    let get_type = unsafe { (api.js_get_value_type)(value, &mut value_type as *mut JsValueType) };
-    get_type == JS_NO_ERROR && value_type == JS_VALUE_TYPE_UNDEFINED
+    let mut t = JS_VALUE_TYPE_UNDEFINED;
+    let rc = unsafe { (api.js_get_value_type)(value, &mut t) };
+    rc == JS_NO_ERROR && t == JS_VALUE_TYPE_UNDEFINED
 }
 
-fn ensure_js_ok(error_code: JsErrorCode, operation: &str) -> Result<(), String> {
-    if error_code == JS_NO_ERROR {
-        Ok(())
-    } else {
-        Err(format_js_error(operation, error_code))
-    }
+fn ensure_js_ok(code: JsErrorCode, op: &str) -> Result<(), String> {
+    if code == JS_NO_ERROR { Ok(()) } else { Err(format_js_error(op, code)) }
 }
 
-fn format_js_error(operation: &str, error_code: JsErrorCode) -> String {
-    format!("{} failed with {} (0x{:X})", operation, error_name(error_code), error_code)
+fn format_js_error(op: &str, code: JsErrorCode) -> String {
+    format!("{} failed: {} (0x{:X})", op, error_name(code), code)
 }
 
-fn error_name(error_code: JsErrorCode) -> &'static str {
-    match error_code {
-        JS_NO_ERROR => "JsNoError",
-        0x10001 => "JsErrorInvalidArgument",
-        0x10003 => "JsErrorNoCurrentContext",
-        0x10004 => "JsErrorInExceptionState",
-        0x10007 => "JsErrorRuntimeInUse",
-        0x20000 => "JsErrorCategoryEngine",
-        0x20001 => "JsErrorOutOfMemory",
+fn error_name(code: JsErrorCode) -> &'static str {
+    match code {
+        JS_NO_ERROR              => "JsNoError",
+        0x10001                  => "JsErrorInvalidArgument",
+        0x10003                  => "JsErrorNoCurrentContext",
+        0x10004                  => "JsErrorInExceptionState",
+        0x10007                  => "JsErrorRuntimeInUse",
+        0x20000                  => "JsErrorCategoryEngine",
+        0x20001                  => "JsErrorOutOfMemory",
         JS_ERROR_SCRIPT_EXCEPTION => "JsErrorScriptException",
-        JS_ERROR_SCRIPT_COMPILE => "JsErrorScriptCompile",
-        0x30003 => "JsErrorScriptTerminated",
-        0x40001 => "JsErrorFatal",
-        _ => "JsErrorCode(unknown)",
+        JS_ERROR_SCRIPT_COMPILE   => "JsErrorScriptCompile",
+        0x30003                  => "JsErrorScriptTerminated",
+        0x40001                  => "JsErrorFatal",
+        _                        => "JsErrorCode(unknown)",
     }
 }
 
-fn chakra_library_candidates(path_hint: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(hint) = path_hint {
-        candidates.push(hint.to_path_buf());
+fn chakra_library_candidates(hint: Option<&Path>) -> Vec<PathBuf> {
+    let name = default_chakra_library_name();
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Some(p) = hint { v.push(p.into()); }
+    if let Ok(p) = env::var("CHAKRA_CORE_PATH") { if !p.trim().is_empty() { v.push(p.into()); } }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(d) = exe.parent() { v.push(d.join(name)); }
     }
+    if let Ok(d) = env::current_dir() { v.push(d.join(name)); }
+    v.push(name.into());
 
-    if let Ok(path_from_env) = env::var("CHAKRA_CORE_PATH") {
-        if !path_from_env.trim().is_empty() {
-            candidates.push(PathBuf::from(path_from_env));
-        }
-    }
-
-    let default_name = default_chakra_library_name();
-
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join(default_name));
-        }
-    }
-
-    if let Ok(current_dir) = env::current_dir() {
-        candidates.push(current_dir.join(default_name));
-    }
-
-    candidates.push(PathBuf::from(default_name));
-
-    dedupe_paths(candidates)
-}
-
-fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut unique = Vec::new();
-    for path in paths {
-        if !unique.iter().any(|existing| existing == &path) {
-            unique.push(path);
-        }
-    }
+    // deduplicate
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for p in v { if !unique.contains(&p) { unique.push(p); } }
     unique
 }
 
-fn should_try_es2021_transform(source_text: &str) -> bool {
-    source_text.contains("&&=") || source_text.contains("||=") || source_text.contains("??=")
+fn default_chakra_library_name() -> &'static str {
+    if cfg!(target_os = "windows") { "ChakraCore.dll" }
+    else if cfg!(target_os = "macos") { "libChakraCore.dylib" }
+    else { "libChakraCore.so" }
 }
 
+fn should_try_es2021_transform(src: &str) -> bool {
+    src.contains("&&=") || src.contains("||=") || src.contains("??=")
+}
+
+// ─── Multiline input detection ───────────────────────────────────────────────
+
 fn js_source_needs_more_input(source: &str) -> bool {
-    let mut brace_depth = 0i32;
-    let mut bracket_depth = 0i32;
-    let mut paren_depth = 0i32;
+    let mut brace = 0i32;
+    let mut bracket = 0i32;
+    let mut paren = 0i32;
     let mut in_single = false;
     let mut in_double = false;
     let mut in_template = false;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
+    let mut prev = '\0';
     let mut escaped = false;
 
     for ch in source.chars() {
         if in_line_comment {
-            if ch == '\n' {
-                in_line_comment = false;
-            }
-            continue;
+            if ch == '\n' { in_line_comment = false; }
+            prev = ch; continue;
         }
-
         if in_block_comment {
-            if ch == '*' {
-                escaped = true;
-            } else if ch == '/' && escaped {
-                in_block_comment = false;
-                escaped = false;
-            } else {
-                escaped = false;
-            }
-            continue;
+            if ch == '/' && prev == '*' { in_block_comment = false; }
+            prev = ch; continue;
         }
-
         if in_single {
-            if ch == '\\' && !escaped {
-                escaped = true;
-                continue;
-            }
-            if ch == '\'' && !escaped {
-                in_single = false;
-            }
-            escaped = false;
-            continue;
+            if ch == '\\' && !escaped { escaped = true; prev = ch; continue; }
+            if ch == '\'' && !escaped { in_single = false; }
+            escaped = false; prev = ch; continue;
         }
-
         if in_double {
-            if ch == '\\' && !escaped {
-                escaped = true;
-                continue;
-            }
-            if ch == '"' && !escaped {
-                in_double = false;
-            }
-            escaped = false;
-            continue;
+            if ch == '\\' && !escaped { escaped = true; prev = ch; continue; }
+            if ch == '"' && !escaped { in_double = false; }
+            escaped = false; prev = ch; continue;
         }
-
         if in_template {
-            if ch == '\\' && !escaped {
-                escaped = true;
-                continue;
-            }
-            if ch == '`' && !escaped {
-                in_template = false;
-            }
-            escaped = false;
-            continue;
+            if ch == '\\' && !escaped { escaped = true; prev = ch; continue; }
+            if ch == '`' && !escaped { in_template = false; }
+            escaped = false; prev = ch; continue;
         }
-
         match ch {
-            '/' => {
-                escaped = !escaped;
-            }
-            '\'' => in_single = true,
-            '"' => in_double = true,
-            '`' => in_template = true,
-            '{' => brace_depth += 1,
-            '}' => brace_depth -= 1,
-            '[' => bracket_depth += 1,
-            ']' => bracket_depth -= 1,
-            '(' => paren_depth += 1,
-            ')' => paren_depth -= 1,
+            '/' if prev == '/' => { in_line_comment = true; }
+            '*' if prev == '/' => { in_block_comment = true; }
+            '\'' => in_single   = true,
+            '"'  => in_double   = true,
+            '`'  => in_template = true,
+            '{'  => brace    += 1,
+            '}'  => brace    -= 1,
+            '['  => bracket  += 1,
+            ']'  => bracket  -= 1,
+            '('  => paren    += 1,
+            ')'  => paren    -= 1,
             _ => {}
         }
-
-        if ch == '/' && !escaped {
-            let prev_two = source.chars().rev().take(2).collect::<Vec<char>>();
-            if prev_two.len() == 2 && prev_two[0] == '/' && prev_two[1] == '/' {
-                in_line_comment = true;
-            }
-        }
-
-        if ch == '*' && !escaped {
-            let prev_two = source.chars().rev().take(2).collect::<Vec<char>>();
-            if prev_two.len() == 2 && prev_two[0] == '/' && prev_two[1] == '*' {
-                in_block_comment = true;
-            }
-        }
+        prev = ch;
     }
 
-    if in_single || in_double || in_template || in_line_comment || in_block_comment {
-        return true;
-    }
+    if in_single || in_double || in_template || in_block_comment { return true; }
+    if brace > 0 || bracket > 0 || paren > 0 { return true; }
 
-    if brace_depth > 0 || bracket_depth > 0 || paren_depth > 0 {
-        return true;
-    }
+    let t = source.trim_end();
+    if t.is_empty() { return true; }
 
-    let trimmed = source.trim_end();
-    if trimmed.is_empty() {
-        return true;
-    }
-
-    matches!(trimmed.chars().last(), Some('\\' | '.' | ',' | ':' | '=' | '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '!' | '?' | '(' | '[' | '{'))
+    matches!(t.chars().last(), Some(
+        '\\' | '.' | ',' | ':' | '=' | '+' | '-' | '*' | '/' | '%' |
+        '&'  | '|' | '^' | '!' | '?' | '(' | '[' | '{'
+    ))
 }
 
+// ─── Syntax highlighter ───────────────────────────────────────────────────────
+
 fn highlight_js_line(line: &str, keywords: &[&str]) -> String {
-    let mut output = String::with_capacity(line.len() + 32);
+    let mut out = String::with_capacity(line.len() + 64);
     let mut chars = line.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
@@ -1103,251 +1088,169 @@ fn highlight_js_line(line: &str, keywords: &[&str]) -> String {
 
     while let Some(ch) = chars.next() {
         if in_block_comment {
-            output.push_str("\x1b[38;5;244m");
-            output.push(ch);
+            out.push_str("\x1b[38;5;244m");
+            out.push(ch);
             if ch == '*' && matches!(chars.peek(), Some('/')) {
-                output.push('/');
-                let _ = chars.next();
-                output.push_str("\x1b[0m");
+                out.push('/'); chars.next();
+                out.push_str("\x1b[0m");
                 in_block_comment = false;
             }
             continue;
         }
-
-        if in_single {
-            output.push_str("\x1b[38;5;214m");
-            output.push(ch);
-            if ch == '\\' {
-                if let Some(next) = chars.next() {
-                    output.push(next);
+        macro_rules! string_char {
+            ($flag:ident, $close:expr) => {
+                if $flag {
+                    out.push_str("\x1b[38;5;214m");
+                    out.push(ch);
+                    if ch == '\\' { if let Some(n) = chars.next() { out.push(n); } }
+                    else if ch == $close { out.push_str("\x1b[0m"); $flag = false; }
+                    continue;
                 }
-            } else if ch == '\'' {
-                output.push_str("\x1b[0m");
-                in_single = false;
-            }
-            continue;
+            };
         }
-
-        if in_double {
-            output.push_str("\x1b[38;5;214m");
-            output.push(ch);
-            if ch == '\\' {
-                if let Some(next) = chars.next() {
-                    output.push(next);
-                }
-            } else if ch == '"' {
-                output.push_str("\x1b[0m");
-                in_double = false;
-            }
-            continue;
-        }
-
-        if in_template {
-            output.push_str("\x1b[38;5;214m");
-            output.push(ch);
-            if ch == '\\' {
-                if let Some(next) = chars.next() {
-                    output.push(next);
-                }
-            } else if ch == '`' {
-                output.push_str("\x1b[0m");
-                in_template = false;
-            }
-            continue;
-        }
+        string_char!(in_single,   '\'');
+        string_char!(in_double,   '"');
+        string_char!(in_template, '`');
 
         if ch == '/' {
             match chars.peek() {
                 Some('/') => {
-                    output.push_str("\x1b[38;5;244m//");
-                    let _ = chars.next();
-                    for rest in chars {
-                        output.push(rest);
-                    }
-                    output.push_str("\x1b[0m");
+                    out.push_str("\x1b[38;5;244m//");
+                    chars.next();
+                    for c in &mut chars { out.push(c); }
+                    out.push_str("\x1b[0m");
                     break;
                 }
                 Some('*') => {
-                    output.push_str("\x1b[38;5;244m/*");
-                    let _ = chars.next();
+                    out.push_str("\x1b[38;5;244m/*");
+                    chars.next();
                     in_block_comment = true;
                     continue;
                 }
                 _ => {}
             }
         }
-
-        if ch == '\'' {
-            output.push_str("\x1b[38;5;214m'");
-            in_single = true;
-            continue;
-        }
-
-        if ch == '"' {
-            output.push_str("\x1b[38;5;214m\"");
-            in_double = true;
-            continue;
-        }
-
-        if ch == '`' {
-            output.push_str("\x1b[38;5;214m`");
-            in_template = true;
-            continue;
-        }
+        if ch == '\'' { out.push_str("\x1b[38;5;214m'"); in_single   = true; continue; }
+        if ch == '"'  { out.push_str("\x1b[38;5;214m\""); in_double  = true; continue; }
+        if ch == '`'  { out.push_str("\x1b[38;5;214m`"); in_template = true; continue; }
 
         if ch.is_ascii_digit() {
-            output.push_str("\x1b[38;5;81m");
-            output.push(ch);
-            while let Some(next) = chars.peek() {
-                if next.is_ascii_alphanumeric() || matches!(next, '.' | '_' | 'x' | 'X' | 'b' | 'B' | 'o' | 'O') {
-                    output.push(*next);
-                    let _ = chars.next();
-                } else {
-                    break;
-                }
+            out.push_str("\x1b[38;5;81m");
+            out.push(ch);
+            while let Some(&n) = chars.peek() {
+                if n.is_ascii_alphanumeric() || matches!(n, '.' | '_') {
+                    out.push(n); chars.next();
+                } else { break; }
             }
-            output.push_str("\x1b[0m");
+            out.push_str("\x1b[0m");
             continue;
         }
 
         if ch.is_ascii_alphabetic() || ch == '_' || ch == '$' {
             let mut word = String::new();
             word.push(ch);
-            while let Some(next) = chars.peek() {
-                if next.is_ascii_alphanumeric() || *next == '_' || *next == '$' {
-                    word.push(*next);
-                    let _ = chars.next();
-                } else {
-                    break;
-                }
+            while let Some(&n) = chars.peek() {
+                if n.is_ascii_alphanumeric() || n == '_' || n == '$' { word.push(n); chars.next(); }
+                else { break; }
             }
-
             if keywords.contains(&word.as_str()) {
-                output.push_str("\x1b[1;34m");
-                output.push_str(&word);
-                output.push_str("\x1b[0m");
-            } else if word == "console" || word == "print" || word == "require" {
-                output.push_str("\x1b[1;36m");
-                output.push_str(&word);
-                output.push_str("\x1b[0m");
+                out.push_str("\x1b[1;34m"); out.push_str(&word); out.push_str("\x1b[0m");
+            } else if matches!(word.as_str(), "console" | "print" | "require" | "module" | "exports") {
+                out.push_str("\x1b[1;36m"); out.push_str(&word); out.push_str("\x1b[0m");
+            } else if matches!(word.as_str(), "true" | "false" | "null" | "undefined" | "NaN" | "Infinity") {
+                out.push_str("\x1b[38;5;208m"); out.push_str(&word); out.push_str("\x1b[0m");
             } else {
-                output.push_str(&word);
+                out.push_str(&word);
             }
             continue;
         }
 
-        output.push(ch);
+        out.push(ch);
     }
 
-    output.push_str("\x1b[0m");
-    output
+    out.push_str("\x1b[0m");
+    out
 }
+
+// ─── Keywords ─────────────────────────────────────────────────────────────────
 
 const JS_KEYWORDS: &[&str] = &[
     "await", "async", "break", "case", "catch", "class", "const", "continue", "debugger",
-    "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally",
-    "for", "function", "if", "import", "in", "instanceof", "let", "new", "null", "return",
-    "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while",
-    "with", "yield",
+    "default", "delete", "do", "else", "enum", "export", "extends", "finally", "for",
+    "function", "if", "import", "in", "instanceof", "let", "new", "return", "super",
+    "switch", "this", "throw", "try", "typeof", "var", "void", "while", "with", "yield",
+    "of", "from", "static",
 ];
 
-fn default_chakra_library_name() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        "ChakraCore.dll"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "libChakraCore.so"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "libChakraCore.dylib"
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    {
-        "libChakraCore.so"
-    }
-}
+// ─── CLI ──────────────────────────────────────────────────────────────────────
 
 struct CliArgs {
-    chakra_lib: Option<PathBuf>,
+    chakra_lib:  Option<PathBuf>,
     script_path: Option<PathBuf>,
-    repl: bool,
+    repl:        bool,
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
     let mut args = env::args().skip(1);
-    let mut chakra_lib = None;
+    let mut chakra_lib  = None;
     let mut script_path = None;
-    let mut repl = false;
+    let mut repl        = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-h" | "--help" => {
-                print_usage();
-                return Err(String::new());
+            "-h" | "--help" => { print_usage(); return Err(String::new()); }
+            "--chakra-lib"  => {
+                chakra_lib = Some(PathBuf::from(
+                    args.next().ok_or("--chakra-lib requires a path")?
+                ));
             }
-            "--chakra-lib" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--chakra-lib expects a path argument".to_string())?;
-                chakra_lib = Some(PathBuf::from(value));
-            }
-            "--repl" | "-i" => {
-                repl = true;
-            }
+            "--repl" | "-i" => repl = true,
             _ => {
-                if script_path.is_none() {
-                    script_path = Some(PathBuf::from(arg));
-                } else {
-                    return Err("Only one script path is supported currently.".to_string());
-                }
+                if script_path.is_none() { script_path = Some(PathBuf::from(arg)); }
+                else { return Err("Only one script path supported.".into()); }
             }
         }
     }
 
     if script_path.is_none() && !repl {
-        return Err("Missing script path. Use --help to see usage, or pass --repl to start the interactive shell.".to_string());
+        return Err("Provide a script path or pass --repl. Use --help for usage.".into());
     }
 
-    Ok(CliArgs {
-        chakra_lib,
-        script_path,
-        repl,
-    })
+    Ok(CliArgs { chakra_lib, script_path, repl })
 }
 
 fn print_usage() {
-    println!("chakra_runtime - cross-platform Rust ChakraCore host");
+    println!("chakra_runtime — Rust-based ChakraCore host");
+    println!();
     println!("Usage:");
-    println!("  chakra_runtime [--chakra-lib <path-to-ChakraCore-shared-library>] <script.js>");
+    println!("  chakra_runtime [--chakra-lib <lib>] <script.js>");
     println!("  chakra_runtime --repl");
+    println!("  chakra_runtime -i");
+    println!();
+    println!("Environment:");
+    println!("  CHAKRA_CORE_PATH   Override the ChakraCore shared library path");
 }
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn run() -> Result<(), String> {
     let cli = match parse_cli_args() {
-        Ok(value) => value,
-        Err(message) if message.is_empty() => return Ok(()),
-        Err(message) => return Err(message),
+        Ok(v)                          => v,
+        Err(e) if e.is_empty()         => return Ok(()),
+        Err(e)                         => return Err(e),
     };
-
     let runtime = HostRuntime::create(cli.chakra_lib.as_deref())?;
-
     if cli.repl || cli.script_path.is_none() {
         return runtime.run_repl();
     }
-
     runtime.run_script_file(cli.script_path.as_ref().unwrap())
 }
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            if !error.trim().is_empty() {
-                eprintln!("{}", error);
-            }
+        Ok(())  => ExitCode::SUCCESS,
+        Err(e)  => {
+            if !e.trim().is_empty() { eprintln!("{}", e); }
             ExitCode::from(1)
         }
     }

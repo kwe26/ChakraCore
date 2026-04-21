@@ -5,6 +5,10 @@
 #include "JsrtPch.h"
 #include "ChakraCore.h"
 
+#ifdef __valid
+#undef __valid
+#endif
+
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -141,7 +145,7 @@ namespace
         free(envValue);
         return true;
 #else
-        const char* envValue = std::getenv(variableName);
+        const char* envValue = getenv(variableName);
         if (envValue == nullptr || envValue[0] == '\0')
         {
             return false;
@@ -789,7 +793,7 @@ namespace
         return JsCreateString(text.c_str(), text.length(), result);
     }
 
-    JsErrorCode GetPropertyByName(JsValueRef object, const wchar_t* propertyName, JsValueRef* propertyValue)
+    JsErrorCode GetPropertyByName(JsValueRef object, const char* propertyName, JsValueRef* propertyValue)
     {
         if (propertyName == nullptr || propertyValue == nullptr)
         {
@@ -797,7 +801,7 @@ namespace
         }
 
         JsPropertyIdRef propertyId = JS_INVALID_REFERENCE;
-        JsErrorCode errorCode = JsGetPropertyIdFromName(propertyName, &propertyId);
+        JsErrorCode errorCode = JsCreatePropertyId(propertyName, strlen(propertyName), &propertyId);
         if (errorCode != JsNoError)
         {
             return errorCode;
@@ -806,7 +810,7 @@ namespace
         return JsGetProperty(object, propertyId, propertyValue);
     }
 
-    JsErrorCode SetPropertyByName(JsValueRef object, const wchar_t* propertyName, JsValueRef propertyValue)
+    JsErrorCode SetPropertyByName(JsValueRef object, const char* propertyName, JsValueRef propertyValue)
     {
         if (propertyName == nullptr)
         {
@@ -814,7 +818,7 @@ namespace
         }
 
         JsPropertyIdRef propertyId = JS_INVALID_REFERENCE;
-        JsErrorCode errorCode = JsGetPropertyIdFromName(propertyName, &propertyId);
+        JsErrorCode errorCode = JsCreatePropertyId(propertyName, strlen(propertyName), &propertyId);
         if (errorCode != JsNoError)
         {
             return errorCode;
@@ -823,7 +827,7 @@ namespace
         return JsSetProperty(object, propertyId, propertyValue, true);
     }
 
-    JsErrorCode InstallMethod(JsValueRef object, const wchar_t* propertyName, JsNativeFunction callback)
+    JsErrorCode InstallMethod(JsValueRef object, const char* propertyName, JsNativeFunction callback)
     {
         JsValueRef functionValue = JS_INVALID_REFERENCE;
         JsErrorCode errorCode = JsCreateFunction(callback, nullptr, &functionValue);
@@ -857,14 +861,14 @@ namespace
         }
 
         JsValueRef jsonObject = JS_INVALID_REFERENCE;
-        errorCode = GetPropertyByName(globalObject, L"JSON", &jsonObject);
+        errorCode = GetPropertyByName(globalObject, "JSON", &jsonObject);
         if (errorCode != JsNoError)
         {
             return errorCode;
         }
 
         JsValueRef parseFunction = JS_INVALID_REFERENCE;
-        errorCode = GetPropertyByName(jsonObject, L"parse", &parseFunction);
+        errorCode = GetPropertyByName(jsonObject, "parse", &parseFunction);
         if (errorCode != JsNoError)
         {
             return errorCode;
@@ -1370,7 +1374,7 @@ namespace
             return errorCode;
         }
 
-        return InstallMethod(*packageObject, L"version", InfoVersionCallback);
+        return InstallMethod(*packageObject, "version", InfoVersionCallback);
     }
 
     JsErrorCode CreateFsPackageObject(JsValueRef* packageObject)
@@ -1381,19 +1385,19 @@ namespace
             return errorCode;
         }
 
-        errorCode = InstallMethod(*packageObject, L"readFileSync", FsReadFileSyncCallback);
+        errorCode = InstallMethod(*packageObject, "readFileSync", FsReadFileSyncCallback);
         if (errorCode != JsNoError)
         {
             return errorCode;
         }
 
-        errorCode = InstallMethod(*packageObject, L"writeFileSync", FsWriteFileSyncCallback);
+        errorCode = InstallMethod(*packageObject, "writeFileSync", FsWriteFileSyncCallback);
         if (errorCode != JsNoError)
         {
             return errorCode;
         }
 
-        return InstallMethod(*packageObject, L"existsSync", FsExistsSyncCallback);
+        return InstallMethod(*packageObject, "existsSync", FsExistsSyncCallback);
     }
 
     JsErrorCode CreateReqwestPackageObject(JsValueRef* packageObject)
@@ -1404,25 +1408,25 @@ namespace
             return errorCode;
         }
 
-        errorCode = InstallMethod(*packageObject, L"get", ReqwestGetCallback);
+        errorCode = InstallMethod(*packageObject, "get", ReqwestGetCallback);
         if (errorCode != JsNoError)
         {
             return errorCode;
         }
 
-        errorCode = InstallMethod(*packageObject, L"post", ReqwestPostCallback);
+        errorCode = InstallMethod(*packageObject, "post", ReqwestPostCallback);
         if (errorCode != JsNoError)
         {
             return errorCode;
         }
 
-        errorCode = InstallMethod(*packageObject, L"fetch", ReqwestFetchCallback);
+        errorCode = InstallMethod(*packageObject, "fetch", ReqwestFetchCallback);
         if (errorCode != JsNoError)
         {
             return errorCode;
         }
 
-        return InstallMethod(*packageObject, L"downloadFetch", ReqwestDownloadFetchCallback);
+        return InstallMethod(*packageObject, "downloadFetch", ReqwestDownloadFetchCallback);
     }
 
     JsErrorCode CreateEs2020PackageObject(JsValueRef* packageObject)
@@ -1433,7 +1437,7 @@ namespace
             return errorCode;
         }
 
-        return InstallMethod(*packageObject, L"analyze", Es2020AnalyzeCallback);
+        return InstallMethod(*packageObject, "analyze", Es2020AnalyzeCallback);
     }
 
     JsErrorCode CreateEs2021PackageObject(JsValueRef* packageObject)
@@ -1444,13 +1448,13 @@ namespace
             return errorCode;
         }
 
-        errorCode = InstallMethod(*packageObject, L"analyze", Es2021AnalyzeCallback);
+        errorCode = InstallMethod(*packageObject, "analyze", Es2021AnalyzeCallback);
         if (errorCode != JsNoError)
         {
             return errorCode;
         }
 
-        return InstallMethod(*packageObject, L"transform", Es2021TransformCallback);
+        return InstallMethod(*packageObject, "transform", Es2021TransformCallback);
     }
 
     JsErrorCode CreateSystemPackageObject(const std::string& moduleName, JsValueRef* packageObject)
@@ -1540,7 +1544,7 @@ CHAKRA_API JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction)
         return errorCode;
     }
 
-    errorCode = SetPropertyByName(globalObject, L"require", functionValue);
+    errorCode = SetPropertyByName(globalObject, "require", functionValue);
     if (errorCode != JsNoError)
     {
         return errorCode;
