@@ -2293,11 +2293,12 @@ namespace
     struct FfiTypeDescriptor
     {
         bool isStruct;
+        bool isUnion;
         FfiPrimitiveType primitive;
         std::vector<std::pair<std::string, FfiTypeDescriptor>> fields;
 
         FfiTypeDescriptor()
-            : isStruct(false), primitive(FfiPrimitiveType::U64)
+            : isStruct(false), isUnion(false), primitive(FfiPrimitiveType::U64)
         {
         }
     };
@@ -2470,6 +2471,7 @@ namespace
             }
 
             descriptor->isStruct = false;
+            descriptor->isUnion = false;
             descriptor->primitive = primitiveType;
             descriptor->fields.clear();
             return true;
@@ -2478,6 +2480,7 @@ namespace
         if (valueType == JsFunction && IsStringConstructor(value))
         {
             descriptor->isStruct = false;
+            descriptor->isUnion = false;
             descriptor->primitive = FfiPrimitiveType::CString;
             descriptor->fields.clear();
             return true;
@@ -2493,6 +2496,7 @@ namespace
             return false;
         }
 
+        bool treatAsUnion = false;
         JsValueRef kindValue = JS_INVALID_REFERENCE;
         if (GetPropertyByName(value, "__ffiTypeKind", &kindValue) == JsNoError)
         {
@@ -2533,6 +2537,23 @@ namespace
 
                         value = fieldsValue;
                     }
+
+                    if (kindText == "union")
+                    {
+                        JsValueRef fieldsValue = JS_INVALID_REFERENCE;
+                        if (GetPropertyByName(value, "fields", &fieldsValue) != JsNoError)
+                        {
+                            if (errorMessage != nullptr)
+                            {
+                                *errorMessage = "Invalid union type descriptor";
+                            }
+
+                            return false;
+                        }
+
+                        value = fieldsValue;
+                        treatAsUnion = true;
+                    }
                 }
             }
         }
@@ -2571,6 +2592,7 @@ namespace
         }
 
         descriptor->isStruct = true;
+        descriptor->isUnion = treatAsUnion;
         descriptor->fields.clear();
 
         const uint32_t keyCount = static_cast<uint32_t>(keyCountNumber);
@@ -2647,6 +2669,34 @@ namespace
                 if (errorMessage != nullptr)
                 {
                     *errorMessage = "Struct argument must be an object";
+                }
+
+                return false;
+            }
+
+            if (descriptor.isUnion)
+            {
+                for (size_t fieldIndex = 0; fieldIndex < descriptor.fields.size(); ++fieldIndex)
+                {
+                    const std::string& fieldName = descriptor.fields[fieldIndex].first;
+                    const FfiTypeDescriptor& fieldType = descriptor.fields[fieldIndex].second;
+
+                    JsValueRef fieldValue = JS_INVALID_REFERENCE;
+                    if (GetPropertyByName(value, fieldName.c_str(), &fieldValue) != JsNoError)
+                    {
+                        continue;
+                    }
+
+                    JsValueType fieldValueType = JsUndefined;
+                    if (JsGetValueType(fieldValue, &fieldValueType) == JsNoError && fieldValueType != JsUndefined)
+                    {
+                        return MarshalValueToFfiArgs(fieldValue, fieldType, stringStorage, args, errorMessage);
+                    }
+                }
+
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = "Union argument must provide at least one defined field";
                 }
 
                 return false;
@@ -2840,6 +2890,136 @@ namespace
         }
 
         return SetExceptionAndReturnInvalidReference("ffi.type expects a string, String, or object");
+    }
+
+    JsErrorCode CreateCompositeTypeDescriptorValue(const char* kindName, JsValueRef fieldsValue, JsValueRef* descriptorValue)
+    {
+        if (kindName == nullptr || descriptorValue == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        *descriptorValue = JS_INVALID_REFERENCE;
+
+        JsValueRef descriptor = JS_INVALID_REFERENCE;
+        JsErrorCode errorCode = JsCreateObject(&descriptor);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef kindValue = JS_INVALID_REFERENCE;
+        errorCode = JsCreateString(kindName, strlen(kindName), &kindValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = SetPropertyByName(descriptor, "__ffiTypeKind", kindValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = SetPropertyByName(descriptor, "fields", fieldsValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        *descriptorValue = descriptor;
+        return JsNoError;
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiStructCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 2)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.struct requires a fields object");
+        }
+
+        JsValueType fieldsType = JsUndefined;
+        if (JsGetValueType(arguments[1], &fieldsType) != JsNoError || fieldsType != JsObject)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.struct: fields must be an object");
+        }
+
+        JsValueRef descriptor = JS_INVALID_REFERENCE;
+        if (CreateCompositeTypeDescriptorValue("struct", arguments[1], &descriptor) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.struct: failed to create type descriptor");
+        }
+
+        return descriptor;
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiUnionCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 2)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.union requires a fields object");
+        }
+
+        JsValueType fieldsType = JsUndefined;
+        if (JsGetValueType(arguments[1], &fieldsType) != JsNoError || fieldsType != JsObject)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.union: fields must be an object");
+        }
+
+        JsValueRef descriptor = JS_INVALID_REFERENCE;
+        if (CreateCompositeTypeDescriptorValue("union", arguments[1], &descriptor) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.union: failed to create type descriptor");
+        }
+
+        return descriptor;
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiPtrCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        JsValueRef descriptor = JS_INVALID_REFERENCE;
+        if (CreatePrimitiveTypeDescriptorValue("ptr", &descriptor) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.ptr: failed to create pointer type descriptor");
+        }
+
+        if (argumentCount > 1)
+        {
+            JsValueType targetType = JsUndefined;
+            if (JsGetValueType(arguments[1], &targetType) == JsNoError && targetType != JsUndefined && targetType != JsNull)
+            {
+                SetPropertyByName(descriptor, "to", arguments[1]);
+            }
+        }
+
+        return descriptor;
     }
 
     JsErrorCode CreatePrimitiveTypeDescriptorValue(const char* primitiveName, JsValueRef* descriptorValue)
@@ -4344,6 +4524,45 @@ CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject)
         return errorCode;
     }
     errorCode = SetPropertyByName(ffiObj, "type", typeFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.struct
+    JsValueRef structFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiStructCallback, nullptr, &structFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "struct", structFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.union
+    JsValueRef unionFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiUnionCallback, nullptr, &unionFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "union", unionFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.ptr
+    JsValueRef ptrFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiPtrCallback, nullptr, &ptrFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "ptr", ptrFunc);
     if (errorCode != JsNoError)
     {
         return errorCode;
