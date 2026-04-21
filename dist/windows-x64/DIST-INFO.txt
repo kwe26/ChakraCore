@@ -1,0 +1,6 @@
+ChakraCore distribution artifacts
+Configuration=Release
+Platform=x64
+BinOutput=D:\Projects\ChakraCore\Build\VcBuild\bin\x64_release
+RustRuntime=D:\Projects\ChakraCore\rust\runtime\target\release\chakra_runtime.exe
+RustPackages=D:\Projects\ChakraCore\rust\chakra_packages\target\release
