@@ -39,6 +39,10 @@ const JS_ERROR_SCRIPT_COMPILE: JsErrorCode   = 0x30002;
 const JS_RUNTIME_ATTRIBUTE_NONE: JsRuntimeAttributes     = 0;
 const JS_PARSE_SCRIPT_ATTRIBUTE_NONE: JsParseScriptAttributes = 0;
 const JS_VALUE_TYPE_UNDEFINED: JsValueType = 0;
+const JS_VALUE_TYPE_OBJECT: JsValueType = 5;
+const JS_VALUE_TYPE_FUNCTION: JsValueType = 6;
+const JS_VALUE_TYPE_ERROR: JsValueType = 7;
+const JS_VALUE_TYPE_ARRAY: JsValueType = 8;
 
 // ─── Calling-convention shims ────────────────────────────────────────────────
 // All fn-pointer types are defined once per platform to avoid repetition.
@@ -75,6 +79,7 @@ js_fn!(JsCreateFunctionFn   (JsNativeFunction, *mut c_void, *mut JsValueRef) -> 
 js_fn!(JsCreateObjectFn     (*mut JsValueRef) -> JsErrorCode);
 js_fn!(JsCreatePropertyIdFn (*const u8, usize, *mut JsPropertyIdRef) -> JsErrorCode);
 js_fn!(JsSetPropertyFn      (JsValueRef, JsPropertyIdRef, JsValueRef, bool) -> JsErrorCode);
+js_fn!(JsGetPropertyFn      (JsValueRef, JsPropertyIdRef, *mut JsValueRef) -> JsErrorCode);
 js_fn!(JsGetUndefinedValueFn(*mut JsValueRef) -> JsErrorCode);
 js_fn!(JsGetValueTypeFn     (JsValueRef, *mut JsValueType) -> JsErrorCode);
 js_fn!(JsCallFunctionFn     (JsValueRef, *mut JsValueRef, u16, *mut JsValueRef) -> JsErrorCode);
@@ -101,6 +106,7 @@ struct ChakraApi {
     js_create_object:              JsCreateObjectFn,
     js_create_property_id:         JsCreatePropertyIdFn,
     js_set_property:               JsSetPropertyFn,
+    js_get_property:               JsGetPropertyFn,
     js_get_undefined_value:        JsGetUndefinedValueFn,
     js_get_value_type:             JsGetValueTypeFn,
     js_call_function:              JsCallFunctionFn,
@@ -531,12 +537,88 @@ unsafe fn collect_args_as_string(
     let mut out = String::new();
     for i in start_idx..(argc as usize) {
         if !out.is_empty() { out.push_str(sep); }
-        match value_to_string(api, *args.add(i)) {
+        match value_to_console_string(api, *args.add(i)) {
             Ok(s)  => out.push_str(&s),
             Err(e) => { let _ = write!(out, "<toString failed: {}>", e); }
         }
     }
     out
+}
+
+fn value_to_console_string(api: &ChakraApi, value: JsValueRef) -> Result<String, String> {
+    let mut value_type = JS_VALUE_TYPE_UNDEFINED;
+    ensure_js_ok(
+        unsafe { (api.js_get_value_type)(value, &mut value_type) },
+        "JsGetValueType",
+    )?;
+
+    let is_object_like = matches!(
+        value_type,
+        JS_VALUE_TYPE_OBJECT | JS_VALUE_TYPE_FUNCTION | JS_VALUE_TYPE_ERROR | JS_VALUE_TYPE_ARRAY
+    );
+
+    if !is_object_like {
+        return value_to_string(api, value);
+    }
+
+    if let Ok(pretty) = try_json_stringify(api, value) {
+        return Ok(pretty);
+    }
+
+    value_to_string(api, value)
+}
+
+fn try_json_stringify(api: &ChakraApi, value: JsValueRef) -> Result<String, String> {
+    let mut global = ptr::null_mut();
+    ensure_js_ok(
+        unsafe { (api.js_get_global_object)(&mut global) },
+        "JsGetGlobalObject",
+    )?;
+
+    let json_obj = get_property_by_name(api, global, "JSON")?;
+    let stringify_fn = get_property_by_name(api, json_obj, "stringify")?;
+
+    let mut undef = ptr::null_mut();
+    ensure_js_ok(
+        unsafe { (api.js_get_undefined_value)(&mut undef) },
+        "JsGetUndefinedValue",
+    )?;
+
+    let mut space = ptr::null_mut();
+    ensure_js_ok(
+        unsafe { (api.js_create_string)(b"  ".as_ptr(), 2, &mut space) },
+        "JsCreateString(space)",
+    )?;
+
+    let mut args = [json_obj, value, undef, space];
+    let mut result = ptr::null_mut();
+    let rc = unsafe { (api.js_call_function)(stringify_fn, args.as_mut_ptr(), 4, &mut result) };
+    if rc != JS_NO_ERROR {
+        let _ = unsafe { (api.js_get_and_clear_exception)(&mut ptr::null_mut()) };
+        return Err(format_js_error("JSON.stringify", rc));
+    }
+
+    if is_undefined_value(api, result) {
+        return value_to_string(api, value);
+    }
+
+    value_to_string(api, result)
+}
+
+fn get_property_by_name(api: &ChakraApi, obj: JsValueRef, name: &str) -> Result<JsValueRef, String> {
+    let mut pid = ptr::null_mut();
+    ensure_js_ok(
+        unsafe { (api.js_create_property_id)(name.as_ptr(), name.len(), &mut pid) },
+        "JsCreatePropertyId",
+    )?;
+
+    let mut out = ptr::null_mut();
+    ensure_js_ok(
+        unsafe { (api.js_get_property)(obj, pid, &mut out) },
+        "JsGetProperty",
+    )?;
+
+    Ok(out)
 }
 
 /// Return the JS undefined value, or null on error.
@@ -603,6 +685,7 @@ impl ChakraApi {
             js_create_object:           req!(b"JsCreateObject"           as JsCreateObjectFn),
             js_create_property_id:      req!(b"JsCreatePropertyId"       as JsCreatePropertyIdFn),
             js_set_property:            req!(b"JsSetProperty"            as JsSetPropertyFn),
+            js_get_property:            req!(b"JsGetProperty"            as JsGetPropertyFn),
             js_get_undefined_value:     req!(b"JsGetUndefinedValue"      as JsGetUndefinedValueFn),
             js_get_value_type:          req!(b"JsGetValueType"           as JsGetValueTypeFn),
             js_call_function:           req!(b"JsCallFunction"           as JsCallFunctionFn),

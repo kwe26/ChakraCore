@@ -16,6 +16,7 @@
 #include <cctype>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -2279,6 +2280,669 @@ namespace
 
     // ── FFI Support ───────────────────────────────────────────────────────────
 
+    enum class FfiPrimitiveType
+    {
+        I32,
+        U32,
+        I64,
+        U64,
+        Pointer,
+        CString
+    };
+
+    struct FfiTypeDescriptor
+    {
+        bool isStruct;
+        FfiPrimitiveType primitive;
+        std::vector<std::pair<std::string, FfiTypeDescriptor>> fields;
+
+        FfiTypeDescriptor()
+            : isStruct(false), primitive(FfiPrimitiveType::U64)
+        {
+        }
+    };
+
+    struct FfiBoundFunctionState
+    {
+        void* functionPointer;
+        bool hasSignature;
+        std::vector<FfiTypeDescriptor> argumentTypes;
+        bool hasReturnType;
+        FfiTypeDescriptor returnType;
+
+        FfiBoundFunctionState()
+            : functionPointer(nullptr), hasSignature(false), hasReturnType(false)
+        {
+        }
+    };
+
+    std::vector<std::unique_ptr<FfiBoundFunctionState>> g_ffiBoundFunctionStates;
+
+    bool TryParsePrimitiveTypeName(const std::string& typeName, FfiPrimitiveType* primitiveType)
+    {
+        if (primitiveType == nullptr)
+        {
+            return false;
+        }
+
+        std::string lowerName = typeName;
+        for (size_t i = 0; i < lowerName.length(); ++i)
+        {
+            lowerName[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(lowerName[i])));
+        }
+
+        if (lowerName == "i32")
+        {
+            *primitiveType = FfiPrimitiveType::I32;
+            return true;
+        }
+
+        if (lowerName == "u32")
+        {
+            *primitiveType = FfiPrimitiveType::U32;
+            return true;
+        }
+
+        if (lowerName == "i64" || lowerName == "isize")
+        {
+            *primitiveType = FfiPrimitiveType::I64;
+            return true;
+        }
+
+        if (lowerName == "u64" || lowerName == "usize")
+        {
+            *primitiveType = FfiPrimitiveType::U64;
+            return true;
+        }
+
+        if (lowerName == "ptr" || lowerName == "pointer" || lowerName == "void*" || lowerName == "i32*" || lowerName == "u32*" || lowerName == "i64*" || lowerName == "u64*")
+        {
+            *primitiveType = FfiPrimitiveType::Pointer;
+            return true;
+        }
+
+        if (lowerName == "string" || lowerName == "cstring" || lowerName == "char*" || lowerName == "const char*")
+        {
+            *primitiveType = FfiPrimitiveType::CString;
+            return true;
+        }
+
+        return false;
+    }
+
+    JsErrorCode GetObjectKeysArray(JsValueRef object, JsValueRef* keysArray)
+    {
+        if (keysArray == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        JsValueRef globalObject = JS_INVALID_REFERENCE;
+        JsErrorCode errorCode = JsGetGlobalObject(&globalObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef objectConstructor = JS_INVALID_REFERENCE;
+        errorCode = GetPropertyByName(globalObject, "Object", &objectConstructor);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef keysFunction = JS_INVALID_REFERENCE;
+        errorCode = GetPropertyByName(objectConstructor, "keys", &keysFunction);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef callArguments[2] = { objectConstructor, object };
+        return JsCallFunction(keysFunction, callArguments, 2, keysArray);
+    }
+
+    bool IsStringConstructor(JsValueRef value)
+    {
+        JsValueRef globalObject = JS_INVALID_REFERENCE;
+        if (JsGetGlobalObject(&globalObject) != JsNoError)
+        {
+            return false;
+        }
+
+        JsValueRef stringConstructor = JS_INVALID_REFERENCE;
+        if (GetPropertyByName(globalObject, "String", &stringConstructor) != JsNoError)
+        {
+            return false;
+        }
+
+        return stringConstructor == value;
+    }
+
+    bool ParseFfiTypeDescriptor(
+        JsValueRef value,
+        FfiTypeDescriptor* descriptor,
+        std::string* errorMessage)
+    {
+        if (descriptor == nullptr)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Internal type parser error";
+            }
+
+            return false;
+        }
+
+        JsValueType valueType = JsUndefined;
+        if (JsGetValueType(value, &valueType) != JsNoError)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Unable to inspect FFI type descriptor";
+            }
+
+            return false;
+        }
+
+        if (valueType == JsString)
+        {
+            std::string typeName;
+            if (ConvertValueToUtf8String(value, &typeName) != JsNoError)
+            {
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = "Invalid FFI type string";
+                }
+
+                return false;
+            }
+
+            FfiPrimitiveType primitiveType;
+            if (!TryParsePrimitiveTypeName(typeName, &primitiveType))
+            {
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = "Unsupported FFI type: " + typeName;
+                }
+
+                return false;
+            }
+
+            descriptor->isStruct = false;
+            descriptor->primitive = primitiveType;
+            descriptor->fields.clear();
+            return true;
+        }
+
+        if (valueType == JsFunction && IsStringConstructor(value))
+        {
+            descriptor->isStruct = false;
+            descriptor->primitive = FfiPrimitiveType::CString;
+            descriptor->fields.clear();
+            return true;
+        }
+
+        if (valueType != JsObject)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "FFI type must be a string, String constructor, or object";
+            }
+
+            return false;
+        }
+
+        JsValueRef kindValue = JS_INVALID_REFERENCE;
+        if (GetPropertyByName(value, "__ffiTypeKind", &kindValue) == JsNoError)
+        {
+            JsValueType kindType = JsUndefined;
+            if (JsGetValueType(kindValue, &kindType) == JsNoError && kindType == JsString)
+            {
+                std::string kindText;
+                if (ConvertValueToUtf8String(kindValue, &kindText) == JsNoError)
+                {
+                    if (kindText == "primitive")
+                    {
+                        JsValueRef nameValue = JS_INVALID_REFERENCE;
+                        if (GetPropertyByName(value, "name", &nameValue) != JsNoError)
+                        {
+                            if (errorMessage != nullptr)
+                            {
+                                *errorMessage = "Invalid primitive type descriptor";
+                            }
+
+                            return false;
+                        }
+
+                        return ParseFfiTypeDescriptor(nameValue, descriptor, errorMessage);
+                    }
+
+                    if (kindText == "struct")
+                    {
+                        JsValueRef fieldsValue = JS_INVALID_REFERENCE;
+                        if (GetPropertyByName(value, "fields", &fieldsValue) != JsNoError)
+                        {
+                            if (errorMessage != nullptr)
+                            {
+                                *errorMessage = "Invalid struct type descriptor";
+                            }
+
+                            return false;
+                        }
+
+                        value = fieldsValue;
+                    }
+                }
+            }
+        }
+
+        JsValueRef keysArray = JS_INVALID_REFERENCE;
+        if (GetObjectKeysArray(value, &keysArray) != JsNoError)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Unable to read struct field names";
+            }
+
+            return false;
+        }
+
+        JsValueRef lengthValue = JS_INVALID_REFERENCE;
+        if (GetPropertyByName(keysArray, "length", &lengthValue) != JsNoError)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Unable to read struct field count";
+            }
+
+            return false;
+        }
+
+        double keyCountNumber = 0.0;
+        if (JsNumberToDouble(lengthValue, &keyCountNumber) != JsNoError)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Invalid struct field count";
+            }
+
+            return false;
+        }
+
+        descriptor->isStruct = true;
+        descriptor->fields.clear();
+
+        const uint32_t keyCount = static_cast<uint32_t>(keyCountNumber);
+        for (uint32_t index = 0; index < keyCount; ++index)
+        {
+            JsValueRef keyValue = JS_INVALID_REFERENCE;
+            const std::string indexText = std::to_string(index);
+            if (GetPropertyByName(keysArray, indexText.c_str(), &keyValue) != JsNoError)
+            {
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = "Unable to read struct field name";
+                }
+
+                return false;
+            }
+
+            std::string fieldName;
+            if (ConvertValueToUtf8String(keyValue, &fieldName) != JsNoError)
+            {
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = "Struct field name must be a string";
+                }
+
+                return false;
+            }
+
+            JsValueRef fieldTypeValue = JS_INVALID_REFERENCE;
+            if (GetPropertyByName(value, fieldName.c_str(), &fieldTypeValue) != JsNoError)
+            {
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = "Unable to read struct field type for '" + fieldName + "'";
+                }
+
+                return false;
+            }
+
+            FfiTypeDescriptor fieldDescriptor;
+            if (!ParseFfiTypeDescriptor(fieldTypeValue, &fieldDescriptor, errorMessage))
+            {
+                return false;
+            }
+
+            descriptor->fields.push_back(std::make_pair(fieldName, fieldDescriptor));
+        }
+
+        return true;
+    }
+
+    bool MarshalValueToFfiArgs(
+        JsValueRef value,
+        const FfiTypeDescriptor& descriptor,
+        std::vector<std::string>* stringStorage,
+        std::vector<uint64_t>* args,
+        std::string* errorMessage)
+    {
+        if (args == nullptr || stringStorage == nullptr)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Internal marshal error";
+            }
+
+            return false;
+        }
+
+        if (descriptor.isStruct)
+        {
+            JsValueType valueType = JsUndefined;
+            if (JsGetValueType(value, &valueType) != JsNoError || valueType != JsObject)
+            {
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = "Struct argument must be an object";
+                }
+
+                return false;
+            }
+
+            for (size_t fieldIndex = 0; fieldIndex < descriptor.fields.size(); ++fieldIndex)
+            {
+                const std::string& fieldName = descriptor.fields[fieldIndex].first;
+                const FfiTypeDescriptor& fieldType = descriptor.fields[fieldIndex].second;
+
+                JsValueRef fieldValue = JS_INVALID_REFERENCE;
+                if (GetPropertyByName(value, fieldName.c_str(), &fieldValue) != JsNoError)
+                {
+                    if (errorMessage != nullptr)
+                    {
+                        *errorMessage = "Missing struct field: " + fieldName;
+                    }
+
+                    return false;
+                }
+
+                if (!MarshalValueToFfiArgs(fieldValue, fieldType, stringStorage, args, errorMessage))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        if (descriptor.primitive == FfiPrimitiveType::CString)
+        {
+            JsValueType valueType = JsUndefined;
+            if (JsGetValueType(value, &valueType) == JsNoError && (valueType == JsUndefined || valueType == JsNull))
+            {
+                args->push_back(0);
+                return true;
+            }
+
+            std::string text;
+            if (ConvertValueToUtf8String(value, &text) != JsNoError)
+            {
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = "CString argument must be a string";
+                }
+
+                return false;
+            }
+
+            stringStorage->push_back(text);
+            args->push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(stringStorage->back().c_str())));
+            return true;
+        }
+
+        double numberValue = 0.0;
+        if (JsNumberToDouble(value, &numberValue) != JsNoError)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Numeric FFI argument expected";
+            }
+
+            return false;
+        }
+
+        switch (descriptor.primitive)
+        {
+        case FfiPrimitiveType::I32:
+            args->push_back(static_cast<uint64_t>(static_cast<int32_t>(numberValue)));
+            return true;
+        case FfiPrimitiveType::U32:
+            args->push_back(static_cast<uint64_t>(static_cast<uint32_t>(numberValue)));
+            return true;
+        case FfiPrimitiveType::I64:
+            args->push_back(static_cast<uint64_t>(static_cast<int64_t>(numberValue)));
+            return true;
+        case FfiPrimitiveType::U64:
+            args->push_back(static_cast<uint64_t>(numberValue));
+            return true;
+        case FfiPrimitiveType::Pointer:
+            args->push_back(static_cast<uint64_t>(static_cast<uintptr_t>(numberValue)));
+            return true;
+        default:
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Unsupported FFI primitive type";
+            }
+
+            return false;
+        }
+    }
+
+    JsErrorCode ConvertFfiResultToJsValue(uint64_t rawResult, const FfiTypeDescriptor& descriptor, JsValueRef* result)
+    {
+        if (result == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        if (descriptor.isStruct)
+        {
+            return JsDoubleToNumber(static_cast<double>(rawResult), result);
+        }
+
+        switch (descriptor.primitive)
+        {
+        case FfiPrimitiveType::I32:
+            return JsDoubleToNumber(static_cast<double>(static_cast<int32_t>(rawResult)), result);
+        case FfiPrimitiveType::U32:
+            return JsDoubleToNumber(static_cast<double>(static_cast<uint32_t>(rawResult)), result);
+        case FfiPrimitiveType::I64:
+            return JsDoubleToNumber(static_cast<double>(static_cast<int64_t>(rawResult)), result);
+        case FfiPrimitiveType::U64:
+            return JsDoubleToNumber(static_cast<double>(rawResult), result);
+        case FfiPrimitiveType::Pointer:
+            return JsDoubleToNumber(static_cast<double>(static_cast<uintptr_t>(rawResult)), result);
+        case FfiPrimitiveType::CString:
+        {
+            const char* text = reinterpret_cast<const char*>(static_cast<uintptr_t>(rawResult));
+            if (text == nullptr)
+            {
+                return JsGetUndefinedValue(result);
+            }
+
+            return JsCreateString(text, strlen(text), result);
+        }
+        default:
+            return JsDoubleToNumber(static_cast<double>(rawResult), result);
+        }
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiTypeCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 2)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.type requires a type descriptor");
+        }
+
+        JsValueRef input = arguments[1];
+        JsValueType inputType = JsUndefined;
+        if (JsGetValueType(input, &inputType) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.type: invalid descriptor");
+        }
+
+        if (inputType == JsString || (inputType == JsFunction && IsStringConstructor(input)))
+        {
+            std::string primitiveName = "string";
+            if (inputType == JsString)
+            {
+                primitiveName.clear();
+                if (ConvertValueToUtf8String(input, &primitiveName) != JsNoError)
+                {
+                    return SetExceptionAndReturnInvalidReference("ffi.type: invalid primitive type");
+                }
+            }
+
+            JsValueRef descriptor = JS_INVALID_REFERENCE;
+            JsCreateObject(&descriptor);
+
+            JsValueRef kindValue = JS_INVALID_REFERENCE;
+            JsCreateString("primitive", 9, &kindValue);
+            SetPropertyByName(descriptor, "__ffiTypeKind", kindValue);
+
+            JsValueRef nameValue = JS_INVALID_REFERENCE;
+            JsCreateString(primitiveName.c_str(), primitiveName.length(), &nameValue);
+            SetPropertyByName(descriptor, "name", nameValue);
+            return descriptor;
+        }
+
+        if (inputType == JsObject)
+        {
+            JsValueRef descriptor = JS_INVALID_REFERENCE;
+            JsCreateObject(&descriptor);
+
+            JsValueRef kindValue = JS_INVALID_REFERENCE;
+            JsCreateString("struct", 6, &kindValue);
+            SetPropertyByName(descriptor, "__ffiTypeKind", kindValue);
+            SetPropertyByName(descriptor, "fields", input);
+            return descriptor;
+        }
+
+        return SetExceptionAndReturnInvalidReference("ffi.type expects a string, String, or object");
+    }
+
+    JsErrorCode CreatePrimitiveTypeDescriptorValue(const char* primitiveName, JsValueRef* descriptorValue)
+    {
+        if (primitiveName == nullptr || descriptorValue == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        *descriptorValue = JS_INVALID_REFERENCE;
+
+        JsValueRef descriptor = JS_INVALID_REFERENCE;
+        JsErrorCode errorCode = JsCreateObject(&descriptor);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef kindValue = JS_INVALID_REFERENCE;
+        errorCode = JsCreateString("primitive", 9, &kindValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = SetPropertyByName(descriptor, "__ffiTypeKind", kindValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef nameValue = JS_INVALID_REFERENCE;
+        errorCode = JsCreateString(primitiveName, strlen(primitiveName), &nameValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        errorCode = SetPropertyByName(descriptor, "name", nameValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        *descriptorValue = descriptor;
+        return JsNoError;
+    }
+
+    JsErrorCode InstallFfiTypesObject(JsValueRef ffiObj)
+    {
+        JsValueRef typesObject = JS_INVALID_REFERENCE;
+        JsErrorCode errorCode = JsCreateObject(&typesObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        struct FfiTypeEntry
+        {
+            const char* propertyName;
+            const char* primitiveName;
+        };
+
+        static const FfiTypeEntry entries[] =
+        {
+            { "i32", "i32" },
+            { "u32", "u32" },
+            { "i64", "i64" },
+            { "u64", "u64" },
+            { "isize", "isize" },
+            { "usize", "usize" },
+            { "ptr", "ptr" },
+            { "pointer", "pointer" },
+            { "voidPtr", "void*" },
+            { "i32Ptr", "i32*" },
+            { "u32Ptr", "u32*" },
+            { "i64Ptr", "i64*" },
+            { "u64Ptr", "u64*" },
+            { "string", "string" },
+            { "cstring", "cstring" },
+            { "charPtr", "char*" },
+            { "constCharPtr", "const char*" }
+        };
+
+        for (size_t index = 0; index < sizeof(entries) / sizeof(entries[0]); ++index)
+        {
+            JsValueRef descriptor = JS_INVALID_REFERENCE;
+            errorCode = CreatePrimitiveTypeDescriptorValue(entries[index].primitiveName, &descriptor);
+            if (errorCode != JsNoError)
+            {
+                return errorCode;
+            }
+
+            errorCode = SetPropertyByName(typesObject, entries[index].propertyName, descriptor);
+            if (errorCode != JsNoError)
+            {
+                return errorCode;
+            }
+        }
+
+        return SetPropertyByName(ffiObj, "types", typesObject);
+    }
+
     JsValueRef CHAKRA_CALLBACK FfiDlopenCallback(
         _In_ JsValueRef callee,
         _In_ bool isConstructCall,
@@ -2471,22 +3135,101 @@ namespace
             return SetExceptionAndReturnInvalidReference("ffi.func: invalid bound function state");
         }
 
-        void* funcPtr = callbackState;
+        FfiBoundFunctionState* state = reinterpret_cast<FfiBoundFunctionState*>(callbackState);
+        if (state == nullptr || state->functionPointer == nullptr)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.func: invalid bound function state");
+        }
+
+        void* funcPtr = state->functionPointer;
 
         uint64_t callArgs[8] = { 0 };
         uint32_t argc = 0;
-        if (argumentCount > 1)
+        if (!state->hasSignature)
         {
-            const uint32_t providedArgCount = static_cast<uint32_t>(argumentCount - 1);
-            argc = providedArgCount > 8 ? 8 : providedArgCount;
-            for (uint32_t i = 0; i < argc; ++i)
+            std::vector<std::string> untypedStringStorage;
+            if (argumentCount > 1)
             {
-                double value = 0.0;
-                if (JsNumberToDouble(arguments[i + 1], &value) != JsNoError)
+                const uint32_t providedArgCount = static_cast<uint32_t>(argumentCount - 1);
+                argc = providedArgCount > 8 ? 8 : providedArgCount;
+                for (uint32_t i = 0; i < argc; ++i)
                 {
-                    return SetExceptionAndReturnInvalidReference("ffi.func: all arguments must be numbers");
+                    JsValueType argType = JsUndefined;
+                    if (JsGetValueType(arguments[i + 1], &argType) != JsNoError)
+                    {
+                        return SetExceptionAndReturnInvalidReference("ffi.func: unable to inspect argument type");
+                    }
+
+                    if (argType == JsUndefined || argType == JsNull)
+                    {
+                        callArgs[i] = 0;
+                        continue;
+                    }
+
+                    if (argType == JsString)
+                    {
+                        std::string text;
+                        if (ConvertValueToUtf8String(arguments[i + 1], &text) != JsNoError)
+                        {
+                            return SetExceptionAndReturnInvalidReference("ffi.func: failed to convert string argument");
+                        }
+
+                        untypedStringStorage.push_back(text);
+                        callArgs[i] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(untypedStringStorage.back().c_str()));
+                        continue;
+                    }
+
+                    if (argType == JsBoolean)
+                    {
+                        bool boolValue = false;
+                        if (JsBooleanToBool(arguments[i + 1], &boolValue) != JsNoError)
+                        {
+                            return SetExceptionAndReturnInvalidReference("ffi.func: failed to convert boolean argument");
+                        }
+
+                        callArgs[i] = boolValue ? 1 : 0;
+                        continue;
+                    }
+
+                    double value = 0.0;
+                    if (JsNumberToDouble(arguments[i + 1], &value) != JsNoError)
+                    {
+                        return SetExceptionAndReturnInvalidReference("ffi.func: untyped mode accepts number/string/bool/null; use signature for structs/typed pointers");
+                    }
+
+                    callArgs[i] = static_cast<uint64_t>(value);
                 }
-                callArgs[i] = static_cast<uint64_t>(value);
+            }
+        }
+        else
+        {
+            const uint32_t providedArgCount = argumentCount > 0 ? static_cast<uint32_t>(argumentCount - 1) : 0;
+            if (providedArgCount != state->argumentTypes.size())
+            {
+                return SetExceptionAndReturnInvalidReference("ffi.func: argument count does not match signature");
+            }
+
+            std::vector<uint64_t> marshaledArgs;
+            std::vector<std::string> stringStorage;
+            std::string marshalError;
+
+            for (uint32_t i = 0; i < providedArgCount; ++i)
+            {
+                if (!MarshalValueToFfiArgs(arguments[i + 1], state->argumentTypes[i], &stringStorage, &marshaledArgs, &marshalError))
+                {
+                    return SetExceptionAndReturnInvalidReference("ffi.func: " + marshalError);
+                }
+            }
+
+            if (marshaledArgs.size() > 8)
+            {
+                return SetExceptionAndReturnInvalidReference("ffi.func: marshaled argument count exceeds ABI limit (8)");
+            }
+
+            argc = static_cast<uint32_t>(marshaledArgs.size());
+            for (uint32_t index = 0; index < argc; ++index)
+            {
+                callArgs[index] = marshaledArgs[index];
             }
         }
 
@@ -2499,7 +3242,18 @@ namespace
         const uint64_t result = g_ffiApi.call(funcPtr, argc, callArgs);
 
         JsValueRef resultValue = JS_INVALID_REFERENCE;
-        JsDoubleToNumber(static_cast<double>(result), &resultValue);
+        if (state->hasReturnType)
+        {
+            if (ConvertFfiResultToJsValue(result, state->returnType, &resultValue) != JsNoError)
+            {
+                return SetExceptionAndReturnInvalidReference("ffi.func: failed to convert typed return value");
+            }
+        }
+        else
+        {
+            JsDoubleToNumber(static_cast<double>(result), &resultValue);
+        }
+
         return resultValue;
     }
 
@@ -2551,11 +3305,94 @@ namespace
             return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
         }
 
+        std::unique_ptr<FfiBoundFunctionState> state(new FfiBoundFunctionState());
+        state->functionPointer = funcPtr;
+
+        if (argumentCount > 3)
+        {
+            JsValueType signatureType = JsUndefined;
+            if (JsGetValueType(arguments[3], &signatureType) == JsNoError && signatureType != JsUndefined && signatureType != JsNull)
+            {
+                if (signatureType != JsObject)
+                {
+                    return SetExceptionAndReturnInvalidReference("ffi.func: signature must be an object");
+                }
+
+                JsValueRef argsTypeValue = JS_INVALID_REFERENCE;
+                if (GetPropertyByName(arguments[3], "args", &argsTypeValue) == JsNoError)
+                {
+                    JsValueType argsType = JsUndefined;
+                    if (JsGetValueType(argsTypeValue, &argsType) == JsNoError && argsType != JsUndefined && argsType != JsNull)
+                    {
+                        if (argsType != JsArray)
+                        {
+                            return SetExceptionAndReturnInvalidReference("ffi.func: signature.args must be an array");
+                        }
+
+                        JsValueRef argCountValue = JS_INVALID_REFERENCE;
+                        if (GetPropertyByName(argsTypeValue, "length", &argCountValue) != JsNoError)
+                        {
+                            return SetExceptionAndReturnInvalidReference("ffi.func: failed to read signature.args length");
+                        }
+
+                        double argCountNumber = 0.0;
+                        if (JsNumberToDouble(argCountValue, &argCountNumber) != JsNoError)
+                        {
+                            return SetExceptionAndReturnInvalidReference("ffi.func: invalid signature.args length");
+                        }
+
+                        const uint32_t typeCount = static_cast<uint32_t>(argCountNumber);
+                        state->argumentTypes.clear();
+                        state->argumentTypes.reserve(typeCount);
+                        for (uint32_t index = 0; index < typeCount; ++index)
+                        {
+                            JsValueRef typeValue = JS_INVALID_REFERENCE;
+                            const std::string indexText = std::to_string(index);
+                            if (GetPropertyByName(argsTypeValue, indexText.c_str(), &typeValue) != JsNoError)
+                            {
+                                return SetExceptionAndReturnInvalidReference("ffi.func: failed to read signature argument type");
+                            }
+
+                            FfiTypeDescriptor typeDescriptor;
+                            std::string typeError;
+                            if (!ParseFfiTypeDescriptor(typeValue, &typeDescriptor, &typeError))
+                            {
+                                return SetExceptionAndReturnInvalidReference("ffi.func: " + typeError);
+                            }
+
+                            state->argumentTypes.push_back(typeDescriptor);
+                        }
+
+                        state->hasSignature = true;
+                    }
+                }
+
+                JsValueRef returnTypeValue = JS_INVALID_REFERENCE;
+                if (GetPropertyByName(arguments[3], "returns", &returnTypeValue) == JsNoError)
+                {
+                    JsValueType returnType = JsUndefined;
+                    if (JsGetValueType(returnTypeValue, &returnType) == JsNoError && returnType != JsUndefined && returnType != JsNull)
+                    {
+                        std::string returnError;
+                        if (!ParseFfiTypeDescriptor(returnTypeValue, &state->returnType, &returnError))
+                        {
+                            return SetExceptionAndReturnInvalidReference("ffi.func: " + returnError);
+                        }
+
+                        state->hasReturnType = true;
+                        state->hasSignature = true;
+                    }
+                }
+            }
+        }
+
         JsValueRef functionValue = JS_INVALID_REFERENCE;
-        if (JsCreateFunction(FfiBoundFunctionCallback, funcPtr, &functionValue) != JsNoError)
+        if (JsCreateFunction(FfiBoundFunctionCallback, state.get(), &functionValue) != JsNoError)
         {
             return SetExceptionAndReturnInvalidReference("ffi.func: failed to create bound function");
         }
+
+        g_ffiBoundFunctionStates.push_back(std::move(state));
 
         return functionValue;
     }
@@ -3494,6 +4331,26 @@ CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject)
         return errorCode;
     }
     errorCode = SetPropertyByName(ffiObj, "func", funcFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.type
+    JsValueRef typeFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiTypeCallback, nullptr, &typeFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "type", typeFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.types
+    errorCode = InstallFfiTypesObject(ffiObj);
     if (errorCode != JsNoError)
     {
         return errorCode;
