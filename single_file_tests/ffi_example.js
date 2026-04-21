@@ -9,17 +9,16 @@ if (typeof ffi !== 'undefined') {
     // On Windows:
     let lib = ffi.dlopen("kernel32.dll");
     console.log("  Loaded library handle:", lib.handle);
-    let func = ffi.dlsym(lib.handle, "GetCurrentProcessId");
-    console.log("  Resolved function pointer:", func.ptr);
-    let result = ffi.call(func.ptr, []);
+    let getCurrentProcessId = ffi.func(lib.handle, "GetCurrentProcessId");
+    let result = getCurrentProcessId();
     console.log("  GetCurrentProcessId() =>", result);
     ffi.close(lib.handle);
     console.log("  Closed library handle");
     
     // On Linux:
     // let lib = ffi.dlopen("libc.so.6");
-    // let func = ffi.dlsym(lib.handle, "getpid");
-    // let result = ffi.call(func.ptr, []);
+    // let getpid = ffi.func(lib.handle, "getpid");
+    // let result = getpid();
     // ffi.close(lib.handle);
 } else {
     console.log("FFI is not available in this context");

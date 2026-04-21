@@ -34,9 +34,9 @@
 #endif
 
 // Forward declarations
-extern CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject);
-extern CHAKRA_API JsInstallHttpServer(_Out_opt_ JsValueRef* serverObject);
-extern CHAKRA_API JsInstallHttpServerMulti(_Out_opt_ JsValueRef* serverObject);
+CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject);
+CHAKRA_API JsInstallHttpServer(_Out_opt_ JsValueRef* serverObject);
+CHAKRA_API JsInstallHttpServerMulti(_Out_opt_ JsValueRef* serverObject);
 
 namespace
 {
@@ -101,6 +101,9 @@ namespace
     typedef int (__cdecl *ChakraHttpStartFn)(ChakraHttpServerHandle);
     typedef int (__cdecl *ChakraHttpOnRouteFn)(ChakraHttpServerHandle, const uint8_t*, size_t);
     typedef int (__cdecl *ChakraHttpStopFn)(ChakraHttpServerHandle);
+    typedef uint8_t* (__cdecl *ChakraHttpAcceptFn)(ChakraHttpServerHandle);
+    typedef int (__cdecl *ChakraHttpRespondFn)(ChakraHttpServerHandle, uint64_t, uint16_t, const uint8_t*, size_t, const uint8_t*, size_t);
+    typedef void (__cdecl *ChakraHttpFreeStringFn)(uint8_t*);
 #else
     typedef const char* (*ChakraInfoVersionFn)();
     typedef const char* (*ChakraLastErrorFn)();
@@ -124,6 +127,9 @@ namespace
     typedef int (*ChakraHttpStartFn)(ChakraHttpServerHandle);
     typedef int (*ChakraHttpOnRouteFn)(ChakraHttpServerHandle, const uint8_t*, size_t);
     typedef int (*ChakraHttpStopFn)(ChakraHttpServerHandle);
+    typedef uint8_t* (*ChakraHttpAcceptFn)(ChakraHttpServerHandle);
+    typedef int (*ChakraHttpRespondFn)(ChakraHttpServerHandle, uint64_t, uint16_t, const uint8_t*, size_t, const uint8_t*, size_t);
+    typedef void (*ChakraHttpFreeStringFn)(uint8_t*);
 #endif
 
     struct RustPackageApi
@@ -201,11 +207,17 @@ namespace
         ChakraHttpStartFn start;
         ChakraHttpOnRouteFn onRoute;
         ChakraHttpStopFn stop;
+        ChakraHttpAcceptFn accept;
+        ChakraHttpRespondFn respond;
+        ChakraHttpFreeStringFn freeString;
     };
 
     HttpServerApi g_httpServerApi =
     {
         false,
+        nullptr,
+        nullptr,
+        nullptr,
         nullptr,
         nullptr,
         nullptr,
@@ -866,11 +878,20 @@ namespace
                 TryResolveSymbol(g_httpServerApi.library, "chakra_http_on_route"));
             g_httpServerApi.stop = reinterpret_cast<ChakraHttpStopFn>(
                 TryResolveSymbol(g_httpServerApi.library, "chakra_http_stop"));
+            g_httpServerApi.accept = reinterpret_cast<ChakraHttpAcceptFn>(
+                TryResolveSymbol(g_httpServerApi.library, "chakra_http_accept"));
+            g_httpServerApi.respond = reinterpret_cast<ChakraHttpRespondFn>(
+                TryResolveSymbol(g_httpServerApi.library, "chakra_http_respond"));
+            g_httpServerApi.freeString = reinterpret_cast<ChakraHttpFreeStringFn>(
+                TryResolveSymbol(g_httpServerApi.library, "chakra_http_free_string"));
 
             if (g_httpServerApi.serveSingle != nullptr &&
                 g_httpServerApi.serveMulti != nullptr &&
                 g_httpServerApi.start != nullptr &&
-                g_httpServerApi.stop != nullptr)
+                g_httpServerApi.stop != nullptr &&
+                g_httpServerApi.accept != nullptr &&
+                g_httpServerApi.respond != nullptr &&
+                g_httpServerApi.freeString != nullptr)
             {
                 return;
             }
@@ -882,6 +903,9 @@ namespace
             g_httpServerApi.start = nullptr;
             g_httpServerApi.onRoute = nullptr;
             g_httpServerApi.stop = nullptr;
+            g_httpServerApi.accept = nullptr;
+            g_httpServerApi.respond = nullptr;
+            g_httpServerApi.freeString = nullptr;
         }
 
         const std::vector<std::string> candidates = BuildNamedLibraryCandidates(
@@ -914,6 +938,12 @@ namespace
             TryResolveSymbol(g_httpServerApi.library, "chakra_http_on_route"));
         g_httpServerApi.stop = reinterpret_cast<ChakraHttpStopFn>(
             TryResolveSymbol(g_httpServerApi.library, "chakra_http_stop"));
+        g_httpServerApi.accept = reinterpret_cast<ChakraHttpAcceptFn>(
+            TryResolveSymbol(g_httpServerApi.library, "chakra_http_accept"));
+        g_httpServerApi.respond = reinterpret_cast<ChakraHttpRespondFn>(
+            TryResolveSymbol(g_httpServerApi.library, "chakra_http_respond"));
+        g_httpServerApi.freeString = reinterpret_cast<ChakraHttpFreeStringFn>(
+            TryResolveSymbol(g_httpServerApi.library, "chakra_http_free_string"));
     }
 
     bool EnsureHttpServerApiLoaded(std::string* errorMessage)
@@ -930,7 +960,7 @@ namespace
             return false;
         }
 
-        if (g_httpServerApi.serveSingle == nullptr || g_httpServerApi.serveMulti == nullptr || g_httpServerApi.start == nullptr || g_httpServerApi.stop == nullptr)
+        if (g_httpServerApi.serveSingle == nullptr || g_httpServerApi.serveMulti == nullptr || g_httpServerApi.start == nullptr || g_httpServerApi.stop == nullptr || g_httpServerApi.accept == nullptr || g_httpServerApi.respond == nullptr || g_httpServerApi.freeString == nullptr)
         {
             if (errorMessage != nullptr)
             {
@@ -2569,7 +2599,7 @@ namespace
     }
 }
 
-extern CHAKRA_API JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction);
+CHAKRA_API JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction);
 
 JsErrorCode JsEnsureChakraSystemRequireIfMissing()
 {
@@ -2727,6 +2757,58 @@ JsErrorCode JsEnsureHttpServerIfMissing()
 
 namespace
 {
+    std::string NormalizeHttpRouteKey(const std::string& method, const std::string& path)
+    {
+        std::string normalizedMethod = method;
+        for (size_t index = 0; index < normalizedMethod.length(); ++index)
+        {
+            normalizedMethod[index] = static_cast<char>(std::toupper(static_cast<unsigned char>(normalizedMethod[index])));
+        }
+
+        const size_t querySeparator = path.find('?');
+        const std::string normalizedPath = querySeparator == std::string::npos ? path : path.substr(0, querySeparator);
+        return normalizedMethod + ":" + normalizedPath;
+    }
+
+    JsErrorCode StringifyJsonValue(JsValueRef value, std::string* output)
+    {
+        if (output == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        JsValueRef globalObject = JS_INVALID_REFERENCE;
+        JsErrorCode errorCode = JsGetGlobalObject(&globalObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef jsonObject = JS_INVALID_REFERENCE;
+        errorCode = GetPropertyByName(globalObject, "JSON", &jsonObject);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef stringifyFunction = JS_INVALID_REFERENCE;
+        errorCode = GetPropertyByName(jsonObject, "stringify", &stringifyFunction);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef callArguments[2] = { jsonObject, value };
+        JsValueRef stringifiedValue = JS_INVALID_REFERENCE;
+        errorCode = JsCallFunction(stringifyFunction, callArguments, 2, &stringifiedValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        return ConvertValueToUtf8String(stringifiedValue, output);
+    }
+
     // Store routes and event handlers per server instance
     struct HttpServerState
     {
@@ -2746,6 +2828,34 @@ namespace
         _In_opt_ void *callbackState);
 
     JsValueRef CHAKRA_CALLBACK HttpServerEndCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState);
+
+    JsValueRef CHAKRA_CALLBACK HttpServerListenCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState);
+
+    JsValueRef CHAKRA_CALLBACK HttpResponseSendCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState);
+
+    JsValueRef CHAKRA_CALLBACK HttpResponseJsonCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState);
+
+    JsValueRef CHAKRA_CALLBACK HttpResponseEndCallback(
         _In_ JsValueRef callee,
         _In_ bool isConstructCall,
         _In_ JsValueRef *arguments,
@@ -2840,6 +2950,11 @@ namespace
     JsCreateFunction(HttpServerEndCallback, serverObj, &endFunc);
     SetPropertyByName(serverObj, "end", endFunc);
 
+    // Install listen method (blocking request loop)
+    JsValueRef listenFunc = JS_INVALID_REFERENCE;
+    JsCreateFunction(HttpServerListenCallback, serverObj, &listenFunc);
+    SetPropertyByName(serverObj, "listen", listenFunc);
+
     return serverObj;
 }
 
@@ -2884,7 +2999,7 @@ JsValueRef CHAKRA_CALLBACK HttpServerOnCallback(
     }
 
     // Store route handler for later use
-    std::string routeKey = method + ":" + path;
+    std::string routeKey = NormalizeHttpRouteKey(method, path);
 
     JsValueRef handleValue = JS_INVALID_REFERENCE;
     if (GetPropertyByName(arguments[0], "_handle", &handleValue) != JsNoError)
@@ -2910,12 +3025,333 @@ JsValueRef CHAKRA_CALLBACK HttpServerOnCallback(
         return SetExceptionAndReturnInvalidReference("on: failed to register route");
     }
     
-    // In a real implementation, this would be stored and called when requests come in
-    // For now, we just acknowledge registration
+    std::map<uint64_t, HttpServerState>::iterator serverIterator = g_httpServers.find(handle.id);
+    if (serverIterator == g_httpServers.end())
+    {
+        HttpServerState state;
+        state.serverId = handle.id;
+        g_httpServers[handle.id] = state;
+        serverIterator = g_httpServers.find(handle.id);
+    }
+
+    std::map<std::string, JsValueRef>::iterator existingHandler = serverIterator->second.routeHandlers.find(routeKey);
+    if (existingHandler != serverIterator->second.routeHandlers.end())
+    {
+        JsRelease(existingHandler->second, nullptr);
+    }
+
+    JsAddRef(arguments[3], nullptr);
+    serverIterator->second.routeHandlers[routeKey] = arguments[3];
     
     JsValueRef undef = JS_INVALID_REFERENCE;
     JsGetUndefinedValue(&undef);
     return undef; // Return undefined on success
+    }
+
+    JsValueRef CHAKRA_CALLBACK HttpServerListenCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 1)
+        {
+            return SetExceptionAndReturnInvalidReference("listen requires server context");
+        }
+
+        JsValueRef serverObj = arguments[0];
+        JsValueRef handleValue = JS_INVALID_REFERENCE;
+        if (GetPropertyByName(serverObj, "_handle", &handleValue) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("Invalid server object");
+        }
+
+        double handleNum = 0.0;
+        if (JsNumberToDouble(handleValue, &handleNum) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("Invalid server handle");
+        }
+
+        ChakraHttpServerHandle handle;
+        handle.id = static_cast<uint64_t>(handleNum);
+
+        std::string errorMessage;
+        if (!EnsureHttpServerApiLoaded(&errorMessage))
+        {
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        while (true)
+        {
+            uint8_t* requestJson = g_httpServerApi.accept(handle);
+            if (requestJson == nullptr)
+            {
+                break;
+            }
+
+            std::string requestJsonText(reinterpret_cast<const char*>(requestJson));
+            g_httpServerApi.freeString(requestJson);
+
+            JsValueRef requestObject = JS_INVALID_REFERENCE;
+            if (ParseJsonText(requestJsonText, &requestObject) != JsNoError)
+            {
+                continue;
+            }
+
+            JsValueRef methodValue = JS_INVALID_REFERENCE;
+            JsValueRef pathValue = JS_INVALID_REFERENCE;
+            JsValueRef requestIdValue = JS_INVALID_REFERENCE;
+            if (GetPropertyByName(requestObject, "method", &methodValue) != JsNoError ||
+                GetPropertyByName(requestObject, "path", &pathValue) != JsNoError ||
+                GetPropertyByName(requestObject, "id", &requestIdValue) != JsNoError)
+            {
+                continue;
+            }
+
+            std::string requestMethod;
+            std::string requestPath;
+            double requestIdNumber = 0.0;
+            if (ConvertValueToUtf8String(methodValue, &requestMethod) != JsNoError ||
+                ConvertValueToUtf8String(pathValue, &requestPath) != JsNoError ||
+                JsNumberToDouble(requestIdValue, &requestIdNumber) != JsNoError)
+            {
+                continue;
+            }
+
+            const uint64_t requestId = static_cast<uint64_t>(requestIdNumber);
+            const std::string routeKey = NormalizeHttpRouteKey(requestMethod, requestPath);
+
+            std::map<uint64_t, HttpServerState>::iterator serverIterator = g_httpServers.find(handle.id);
+            if (serverIterator == g_httpServers.end())
+            {
+                continue;
+            }
+
+            std::map<std::string, JsValueRef>::iterator handlerIterator = serverIterator->second.routeHandlers.find(routeKey);
+            if (handlerIterator == serverIterator->second.routeHandlers.end())
+            {
+                const char* body = "Route handler not registered";
+                const char* contentType = "text/plain";
+                g_httpServerApi.respond(handle, requestId, 404,
+                    reinterpret_cast<const uint8_t*>(contentType), strlen(contentType),
+                    reinterpret_cast<const uint8_t*>(body), strlen(body));
+                continue;
+            }
+
+            JsValueRef responseObject = JS_INVALID_REFERENCE;
+            JsCreateObject(&responseObject);
+
+            JsValueRef requestIdJs = JS_INVALID_REFERENCE;
+            JsDoubleToNumber(static_cast<double>(requestId), &requestIdJs);
+            SetPropertyByName(responseObject, "_reqId", requestIdJs);
+
+            JsValueRef serverHandleJs = JS_INVALID_REFERENCE;
+            JsDoubleToNumber(static_cast<double>(handle.id), &serverHandleJs);
+            SetPropertyByName(responseObject, "_serverHandle", serverHandleJs);
+
+            JsValueRef sentState = JS_INVALID_REFERENCE;
+            JsDoubleToNumber(0.0, &sentState);
+            SetPropertyByName(responseObject, "_sent", sentState);
+
+            JsValueRef sendFunc = JS_INVALID_REFERENCE;
+            JsCreateFunction(HttpResponseSendCallback, nullptr, &sendFunc);
+            SetPropertyByName(responseObject, "send", sendFunc);
+
+            JsValueRef jsonFunc = JS_INVALID_REFERENCE;
+            JsCreateFunction(HttpResponseJsonCallback, nullptr, &jsonFunc);
+            SetPropertyByName(responseObject, "json", jsonFunc);
+
+            JsValueRef endFunc = JS_INVALID_REFERENCE;
+            JsCreateFunction(HttpResponseEndCallback, nullptr, &endFunc);
+            SetPropertyByName(responseObject, "end", endFunc);
+
+            JsValueRef callArguments[3] = { serverObj, requestObject, responseObject };
+            JsValueRef callbackResult = JS_INVALID_REFERENCE;
+            JsCallFunction(handlerIterator->second, callArguments, 3, &callbackResult);
+
+            JsValueRef sentValue = JS_INVALID_REFERENCE;
+            double sentNumber = 0.0;
+            if (GetPropertyByName(responseObject, "_sent", &sentValue) == JsNoError &&
+                JsNumberToDouble(sentValue, &sentNumber) == JsNoError &&
+                sentNumber < 0.5)
+            {
+                const char* contentType = "text/plain";
+                g_httpServerApi.respond(handle, requestId, 200,
+                    reinterpret_cast<const uint8_t*>(contentType), strlen(contentType),
+                    nullptr, 0);
+            }
+        }
+
+        JsValueRef undef = JS_INVALID_REFERENCE;
+        JsGetUndefinedValue(&undef);
+        return undef;
+    }
+
+    JsValueRef CHAKRA_CALLBACK HttpResponseSendCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 1)
+        {
+            return SetExceptionAndReturnInvalidReference("res.send requires response context");
+        }
+
+        JsValueRef responseObject = arguments[0];
+        JsValueRef requestIdValue = JS_INVALID_REFERENCE;
+        JsValueRef handleValue = JS_INVALID_REFERENCE;
+        if (GetPropertyByName(responseObject, "_reqId", &requestIdValue) != JsNoError ||
+            GetPropertyByName(responseObject, "_serverHandle", &handleValue) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("Invalid response context");
+        }
+
+        double requestIdNumber = 0.0;
+        double handleNumber = 0.0;
+        if (JsNumberToDouble(requestIdValue, &requestIdNumber) != JsNoError ||
+            JsNumberToDouble(handleValue, &handleNumber) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("Invalid response identifiers");
+        }
+
+        std::string body;
+        if (argumentCount > 1)
+        {
+            ConvertValueToUtf8String(arguments[1], &body);
+        }
+
+        const char* contentType = "text/plain";
+        ChakraHttpServerHandle handle;
+        handle.id = static_cast<uint64_t>(handleNumber);
+        g_httpServerApi.respond(handle, static_cast<uint64_t>(requestIdNumber), 200,
+            reinterpret_cast<const uint8_t*>(contentType), strlen(contentType),
+            reinterpret_cast<const uint8_t*>(body.c_str()), body.length());
+
+        JsValueRef sentState = JS_INVALID_REFERENCE;
+        JsDoubleToNumber(1.0, &sentState);
+        SetPropertyByName(responseObject, "_sent", sentState);
+
+        JsValueRef undef = JS_INVALID_REFERENCE;
+        JsGetUndefinedValue(&undef);
+        return undef;
+    }
+
+    JsValueRef CHAKRA_CALLBACK HttpResponseJsonCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 1)
+        {
+            return SetExceptionAndReturnInvalidReference("res.json requires response context");
+        }
+
+        JsValueRef responseObject = arguments[0];
+        JsValueRef requestIdValue = JS_INVALID_REFERENCE;
+        JsValueRef handleValue = JS_INVALID_REFERENCE;
+        if (GetPropertyByName(responseObject, "_reqId", &requestIdValue) != JsNoError ||
+            GetPropertyByName(responseObject, "_serverHandle", &handleValue) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("Invalid response context");
+        }
+
+        double requestIdNumber = 0.0;
+        double handleNumber = 0.0;
+        if (JsNumberToDouble(requestIdValue, &requestIdNumber) != JsNoError ||
+            JsNumberToDouble(handleValue, &handleNumber) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("Invalid response identifiers");
+        }
+
+        std::string body = "null";
+        if (argumentCount > 1)
+        {
+            if (StringifyJsonValue(arguments[1], &body) != JsNoError)
+            {
+                return SetExceptionAndReturnInvalidReference("res.json: failed to stringify payload");
+            }
+        }
+
+        const char* contentType = "application/json";
+        ChakraHttpServerHandle handle;
+        handle.id = static_cast<uint64_t>(handleNumber);
+        g_httpServerApi.respond(handle, static_cast<uint64_t>(requestIdNumber), 200,
+            reinterpret_cast<const uint8_t*>(contentType), strlen(contentType),
+            reinterpret_cast<const uint8_t*>(body.c_str()), body.length());
+
+        JsValueRef sentState = JS_INVALID_REFERENCE;
+        JsDoubleToNumber(1.0, &sentState);
+        SetPropertyByName(responseObject, "_sent", sentState);
+
+        JsValueRef undef = JS_INVALID_REFERENCE;
+        JsGetUndefinedValue(&undef);
+        return undef;
+    }
+
+    JsValueRef CHAKRA_CALLBACK HttpResponseEndCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 1)
+        {
+            return SetExceptionAndReturnInvalidReference("res.end requires response context");
+        }
+
+        JsValueRef responseObject = arguments[0];
+        JsValueRef requestIdValue = JS_INVALID_REFERENCE;
+        JsValueRef handleValue = JS_INVALID_REFERENCE;
+        if (GetPropertyByName(responseObject, "_reqId", &requestIdValue) != JsNoError ||
+            GetPropertyByName(responseObject, "_serverHandle", &handleValue) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("Invalid response context");
+        }
+
+        double requestIdNumber = 0.0;
+        double handleNumber = 0.0;
+        if (JsNumberToDouble(requestIdValue, &requestIdNumber) != JsNoError ||
+            JsNumberToDouble(handleValue, &handleNumber) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("Invalid response identifiers");
+        }
+
+        ChakraHttpServerHandle handle;
+        handle.id = static_cast<uint64_t>(handleNumber);
+        const char* contentType = "text/plain";
+        g_httpServerApi.respond(handle, static_cast<uint64_t>(requestIdNumber), 200,
+            reinterpret_cast<const uint8_t*>(contentType), strlen(contentType),
+            nullptr, 0);
+
+        JsValueRef sentState = JS_INVALID_REFERENCE;
+        JsDoubleToNumber(1.0, &sentState);
+        SetPropertyByName(responseObject, "_sent", sentState);
+
+        JsValueRef undef = JS_INVALID_REFERENCE;
+        JsGetUndefinedValue(&undef);
+        return undef;
     }
 
     JsValueRef CHAKRA_CALLBACK HttpServerEndCallback(
@@ -2957,6 +3393,19 @@ JsValueRef CHAKRA_CALLBACK HttpServerOnCallback(
     }
 
     int result = g_httpServerApi.stop(handle);
+
+    std::map<uint64_t, HttpServerState>::iterator serverIterator = g_httpServers.find(handle.id);
+    if (serverIterator != g_httpServers.end())
+    {
+        for (std::map<std::string, JsValueRef>::iterator routeIterator = serverIterator->second.routeHandlers.begin();
+            routeIterator != serverIterator->second.routeHandlers.end();
+            ++routeIterator)
+        {
+            JsRelease(routeIterator->second, nullptr);
+        }
+
+        g_httpServers.erase(serverIterator);
+    }
     
     JsValueRef resultValue = JS_INVALID_REFERENCE;
     JsDoubleToNumber(static_cast<double>(result), &resultValue);

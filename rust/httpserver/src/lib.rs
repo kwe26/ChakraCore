@@ -9,7 +9,6 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::sync::mpsc::{self, Sender, Receiver};
-use std::ffi::CString;
 
 // ─── C FFI Types ──────────────────────────────────────────────────────────
 
