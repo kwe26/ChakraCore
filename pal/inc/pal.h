@@ -57,6 +57,7 @@ Abstract:
 // are included again later on, they would not undefine our macros.
 #if defined(PLATFORM_UNIX) && defined(HAS_ICU) && defined(PAL_STDCPP_COMPAT) && __cplusplus >= 201703L
 #include <cwchar>
+#include <cwctype> 
 #include <string>
 #include <string_view>
 #endif
