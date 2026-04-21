@@ -2282,6 +2282,8 @@ namespace
 
     enum class FfiPrimitiveType
     {
+        I8,
+        U8,
         I32,
         U32,
         I64,
@@ -2332,6 +2334,18 @@ namespace
             lowerName[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(lowerName[i])));
         }
 
+        if (lowerName == "i8")
+        {
+            *primitiveType = FfiPrimitiveType::I8;
+            return true;
+        }
+
+        if (lowerName == "u8")
+        {
+            *primitiveType = FfiPrimitiveType::U8;
+            return true;
+        }
+
         if (lowerName == "i32")
         {
             *primitiveType = FfiPrimitiveType::I32;
@@ -2356,7 +2370,7 @@ namespace
             return true;
         }
 
-        if (lowerName == "ptr" || lowerName == "pointer" || lowerName == "void*" || lowerName == "i32*" || lowerName == "u32*" || lowerName == "i64*" || lowerName == "u64*")
+        if (lowerName == "ptr" || lowerName == "pointer" || lowerName == "void" || lowerName == "i8*" || lowerName == "u8*" || lowerName == "i32*" || lowerName == "u32*" || lowerName == "i64*" || lowerName == "u64*")
         {
             *primitiveType = FfiPrimitiveType::Pointer;
             return true;
@@ -2765,6 +2779,12 @@ namespace
 
         switch (descriptor.primitive)
         {
+        case FfiPrimitiveType::I8:
+            args->push_back(static_cast<uint64_t>(static_cast<int8_t>(numberValue)));
+            return true;
+        case FfiPrimitiveType::U8:
+            args->push_back(static_cast<uint64_t>(static_cast<uint8_t>(numberValue)));
+            return true;
         case FfiPrimitiveType::I32:
             args->push_back(static_cast<uint64_t>(static_cast<int32_t>(numberValue)));
             return true;
@@ -2804,6 +2824,10 @@ namespace
 
         switch (descriptor.primitive)
         {
+        case FfiPrimitiveType::I8:
+            return JsDoubleToNumber(static_cast<double>(static_cast<int8_t>(rawResult)), result);
+        case FfiPrimitiveType::U8:
+            return JsDoubleToNumber(static_cast<double>(static_cast<uint8_t>(rawResult)), result);
         case FfiPrimitiveType::I32:
             return JsDoubleToNumber(static_cast<double>(static_cast<int32_t>(rawResult)), result);
         case FfiPrimitiveType::U32:
@@ -2993,35 +3017,6 @@ namespace
         return descriptor;
     }
 
-    JsValueRef CHAKRA_CALLBACK FfiPtrCallback(
-        _In_ JsValueRef callee,
-        _In_ bool isConstructCall,
-        _In_ JsValueRef *arguments,
-        _In_ unsigned short argumentCount,
-        _In_opt_ void *callbackState)
-    {
-        UNREFERENCED_PARAMETER(callee);
-        UNREFERENCED_PARAMETER(isConstructCall);
-        UNREFERENCED_PARAMETER(callbackState);
-
-        JsValueRef descriptor = JS_INVALID_REFERENCE;
-        if (CreatePrimitiveTypeDescriptorValue("ptr", &descriptor) != JsNoError)
-        {
-            return SetExceptionAndReturnInvalidReference("ffi.ptr: failed to create pointer type descriptor");
-        }
-
-        if (argumentCount > 1)
-        {
-            JsValueType targetType = JsUndefined;
-            if (JsGetValueType(arguments[1], &targetType) == JsNoError && targetType != JsUndefined && targetType != JsNull)
-            {
-                SetPropertyByName(descriptor, "to", arguments[1]);
-            }
-        }
-
-        return descriptor;
-    }
-
     JsErrorCode CreatePrimitiveTypeDescriptorValue(const char* primitiveName, JsValueRef* descriptorValue)
     {
         if (primitiveName == nullptr || descriptorValue == nullptr)
@@ -3068,6 +3063,35 @@ namespace
         return JsNoError;
     }
 
+    JsValueRef CHAKRA_CALLBACK FfiPtrCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        JsValueRef descriptor = JS_INVALID_REFERENCE;
+        if (CreatePrimitiveTypeDescriptorValue("ptr", &descriptor) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.ptr: failed to create pointer type descriptor");
+        }
+
+        if (argumentCount > 1)
+        {
+            JsValueType targetType = JsUndefined;
+            if (JsGetValueType(arguments[1], &targetType) == JsNoError && targetType != JsUndefined && targetType != JsNull)
+            {
+                SetPropertyByName(descriptor, "to", arguments[1]);
+            }
+        }
+
+        return descriptor;
+    }
+
     JsErrorCode InstallFfiTypesObject(JsValueRef ffiObj)
     {
         JsValueRef typesObject = JS_INVALID_REFERENCE;
@@ -3085,6 +3109,8 @@ namespace
 
         static const FfiTypeEntry entries[] =
         {
+            { "i8", "i8" },
+            { "u8", "u8" },
             { "i32", "i32" },
             { "u32", "u32" },
             { "i64", "i64" },
@@ -3093,7 +3119,9 @@ namespace
             { "usize", "usize" },
             { "ptr", "ptr" },
             { "pointer", "pointer" },
-            { "voidPtr", "void*" },
+            { "void", "void" },
+            { "i8Ptr", "i8*" },
+            { "u8Ptr", "u8*" },
             { "i32Ptr", "i32*" },
             { "u32Ptr", "u32*" },
             { "i64Ptr", "i64*" },

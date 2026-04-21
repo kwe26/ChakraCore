@@ -27,6 +27,7 @@
 *.vcxproj.user
 *.vspscc
 *.wrn
+.chakra_history
 .vs/
 
 # Visual Studio Extensions

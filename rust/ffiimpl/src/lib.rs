@@ -69,7 +69,7 @@ impl From<libloading::Error> for FfiError {
 /// Returns 0 on failure, non-zero handle on success.
 #[no_mangle]
 pub unsafe extern "C" fn chakra_ffi_dlopen(path: *const u8, path_len: usize) -> FfiHandle {
-    if path.is_null() || path_len == 0 {
+    if path.is_null() || path_len <= 0 {
         return FfiHandle::null();
     }
 
@@ -83,28 +83,9 @@ pub unsafe extern "C" fn chakra_ffi_dlopen(path: *const u8, path_len: usize) -> 
         let mut registry = get_registry().lock().unwrap();
         let handle = FfiHandle(HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed));
         registry.insert(handle.0, Box::new(lib));
-        return handle;
-    }
-
-    // Resolve if it's a symlink
-    let resolved_path = match std::fs::canonicalize(path_str) {
-        Ok(p) => p,
-        Err(_) => return FfiHandle::null(),
-    };
-
-    let resolved_str = match resolved_path.to_str() {
-        Some(s) => s,
-        None => return FfiHandle::null(),
-    };
-
-    match Library::new(resolved_str) {
-        Ok(lib) => {
-            let mut registry = get_registry().lock().unwrap();
-            let handle = FfiHandle(HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed));
-            registry.insert(handle.0, Box::new(lib));
-            handle
-        }
-        Err(_) => FfiHandle::null(),
+        handle
+    } else {
+        FfiHandle::null()
     }
 }
 

@@ -282,7 +282,6 @@ WITHOUT_FEATURES=""
 CREATE_DEB=0
 ARCH="-DCC_USES_SYSTEM_ARCH_SH=1"
 OS_LINUX=0
-OS_APT_GET=0
 OS_UNIX=0
 LTO=""
 LTTNG=""
@@ -304,10 +303,6 @@ PYTHON_BINARY=$(which python3 || which python || which python2.7 || which python
 UNAME_S=`uname -s`
 if [[ $UNAME_S =~ 'Linux' ]]; then
     OS_LINUX=1
-    PROC_INFO=$(which apt-get)
-    if [[ ${#PROC_INFO} > 0 && -f "$PROC_INFO" ]]; then
-        OS_APT_GET=1
-    fi
 elif [[ $UNAME_S =~ "Darwin" ]]; then
     OS_UNIX=1
 else
