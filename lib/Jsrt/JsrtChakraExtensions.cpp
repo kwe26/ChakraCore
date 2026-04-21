@@ -3093,7 +3093,7 @@ namespace
             { "usize", "usize" },
             { "ptr", "ptr" },
             { "pointer", "pointer" },
-            { "voidPtr", "void*" },
+            { "void", "void" },
             { "i32Ptr", "i32*" },
             { "u32Ptr", "u32*" },
             { "i64Ptr", "i64*" },
