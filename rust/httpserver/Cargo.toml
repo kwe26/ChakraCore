@@ -1,0 +1,22 @@
+[package]
+name = "chakra-httpserver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+hyper = { version = "1.1", features = ["full"] }
+http = "1.1"
+bytes = "1.5"
+mime = "0.3"
+multipart = "0.18"
+tempfile = "3.8"
+serde_json = "1.0"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true

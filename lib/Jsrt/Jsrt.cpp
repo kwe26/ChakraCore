@@ -24,6 +24,10 @@
 #include "TestHooksRt.h"
 #endif
 
+JsErrorCode JsEnsureChakraSystemRequireIfMissing();
+JsErrorCode JsEnsureFfiIfMissing();
+JsErrorCode JsEnsureHttpServerIfMissing();
+
 CHAKRA_API RunScriptWithParserStateCore(
     _In_ DWORD dwBgParseCookie,
     _In_ JsValueRef script,
@@ -858,6 +862,27 @@ CHAKRA_API JsSetCurrentContext(_In_opt_ JsContextRef newContext)
         if (!JsrtContext::TrySetCurrent((JsrtContext *)newContext))
         {
             return JsErrorWrongThread;
+        }
+
+        if (newContext != nullptr)
+        {
+            const JsErrorCode requireError = JsEnsureChakraSystemRequireIfMissing();
+            if (requireError != JsNoError)
+            {
+                return requireError;
+            }
+
+            const JsErrorCode ffiError = JsEnsureFfiIfMissing();
+            if (ffiError != JsNoError)
+            {
+                return ffiError;
+            }
+
+            const JsErrorCode httpError = JsEnsureHttpServerIfMissing();
+            if (httpError != JsNoError)
+            {
+                return httpError;
+            }
         }
 
         return JsNoError;

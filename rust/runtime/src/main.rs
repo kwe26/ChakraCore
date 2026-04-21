@@ -5,8 +5,9 @@ use rustyline::hint::Hinter;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Context as RustylineContext, Editor, Helper};
 use libloading::{Library, Symbol};
+use std::cell::RefCell;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::c_void;
 use std::fmt::Write as _;
@@ -54,6 +55,12 @@ macro_rules! js_fn {
 js_fn!(JsNativeFunctionRaw(JsValueRef, bool, *mut JsValueRef, u16, *mut c_void) -> JsValueRef);
 type JsNativeFunction = Option<JsNativeFunctionRaw>;
 
+#[cfg(target_os = "windows")]
+type JsPromiseContinuationCallbackRaw = unsafe extern "system" fn(JsValueRef, *mut c_void);
+#[cfg(not(target_os = "windows"))]
+type JsPromiseContinuationCallbackRaw = unsafe extern "C" fn(JsValueRef, *mut c_void);
+type JsPromiseContinuationCallback = Option<JsPromiseContinuationCallbackRaw>;
+
 js_fn!(JsCreateRuntimeFn    (JsRuntimeAttributes, *mut c_void, *mut JsRuntimeHandle) -> JsErrorCode);
 js_fn!(JsDisposeRuntimeFn   (JsRuntimeHandle) -> JsErrorCode);
 js_fn!(JsCreateContextFn    (JsRuntimeHandle, *mut JsContextRef) -> JsErrorCode);
@@ -70,7 +77,10 @@ js_fn!(JsCreatePropertyIdFn (*const u8, usize, *mut JsPropertyIdRef) -> JsErrorC
 js_fn!(JsSetPropertyFn      (JsValueRef, JsPropertyIdRef, JsValueRef, bool) -> JsErrorCode);
 js_fn!(JsGetUndefinedValueFn(*mut JsValueRef) -> JsErrorCode);
 js_fn!(JsGetValueTypeFn     (JsValueRef, *mut JsValueType) -> JsErrorCode);
-js_fn!(JsInstallChakraSystemRequireFn(*mut JsValueRef) -> JsErrorCode);
+js_fn!(JsCallFunctionFn     (JsValueRef, *mut JsValueRef, u16, *mut JsValueRef) -> JsErrorCode);
+js_fn!(JsAddRefFn           (JsValueRef, *mut u32) -> JsErrorCode);
+js_fn!(JsReleaseFn          (JsValueRef, *mut u32) -> JsErrorCode);
+js_fn!(JsSetPromiseContinuationCallbackFn(JsPromiseContinuationCallback, *mut c_void) -> JsErrorCode);
 js_fn!(JsChakraEs2021TransformFn(JsValueRef, *mut JsValueRef) -> JsErrorCode);
 
 // ─── ChakraApi ───────────────────────────────────────────────────────────────
@@ -93,7 +103,10 @@ struct ChakraApi {
     js_set_property:               JsSetPropertyFn,
     js_get_undefined_value:        JsGetUndefinedValueFn,
     js_get_value_type:             JsGetValueTypeFn,
-    js_install_chakra_system_require: Option<JsInstallChakraSystemRequireFn>,
+    js_call_function:              JsCallFunctionFn,
+    js_add_ref:                    JsAddRefFn,
+    js_release:                    JsReleaseFn,
+    js_set_promise_continuation_callback: Option<JsSetPromiseContinuationCallbackFn>,
     js_chakra_es2021_transform:    Option<JsChakraEs2021TransformFn>,
 }
 
@@ -129,6 +142,20 @@ enum ConsoleMethodKind {
 
 struct PrintCallbackState {
     api: *const ChakraApi,
+}
+
+struct PromiseQueueState {
+    api: *const ChakraApi,
+    pending: RefCell<VecDeque<JsValueRef>>,
+}
+
+impl PromiseQueueState {
+    fn new() -> Self {
+        Self {
+            api: ptr::null(),
+            pending: RefCell::new(VecDeque::new()),
+        }
+    }
 }
 
 // Shared state threaded through all console callbacks via a raw pointer
@@ -167,6 +194,7 @@ struct HostRuntime {
     api:                    ChakraApi,
     runtime:                JsRuntimeHandle,
     color_enabled:          bool,
+    promise_state:          Box<PromiseQueueState>,
     // keep alive
     _print_state:           Box<PrintCallbackState>,
     _console_states:        Vec<Box<ConsoleCallbackStateEx>>,
@@ -289,6 +317,29 @@ unsafe fn print_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_vo
     let text = collect_args_as_string(api, args, argc, 1, " ");
     println!("{}", text);
     get_undefined(api)
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn promise_continuation_callback(task: JsValueRef, state: *mut c_void) {
+    promise_continuation_callback_impl(task, state)
+}
+
+#[cfg(not(target_os = "windows"))]
+unsafe extern "C" fn promise_continuation_callback(task: JsValueRef, state: *mut c_void) {
+    promise_continuation_callback_impl(task, state)
+}
+
+const PROMISE_CONTINUATION_CB: JsPromiseContinuationCallback = Some(promise_continuation_callback);
+
+unsafe fn promise_continuation_callback_impl(task: JsValueRef, state: *mut c_void) {
+    if task.is_null() || state.is_null() {
+        return;
+    }
+
+    let promise_state = &*(state as *const PromiseQueueState);
+    let api = &*promise_state.api;
+    let _ = (api.js_add_ref)(task, ptr::null_mut());
+    promise_state.pending.borrow_mut().push_back(task);
 }
 
 // ─── console.* native callback ───────────────────────────────────────────────
@@ -554,8 +605,11 @@ impl ChakraApi {
             js_set_property:            req!(b"JsSetProperty"            as JsSetPropertyFn),
             js_get_undefined_value:     req!(b"JsGetUndefinedValue"      as JsGetUndefinedValueFn),
             js_get_value_type:          req!(b"JsGetValueType"           as JsGetValueTypeFn),
-            js_install_chakra_system_require:
-                                        opt!(b"JsInstallChakraSystemRequire" as JsInstallChakraSystemRequireFn),
+            js_call_function:           req!(b"JsCallFunction"           as JsCallFunctionFn),
+            js_add_ref:                 req!(b"JsAddRef"                 as JsAddRefFn),
+            js_release:                 req!(b"JsRelease"                as JsReleaseFn),
+            js_set_promise_continuation_callback:
+                                        opt!(b"JsSetPromiseContinuationCallback" as JsSetPromiseContinuationCallbackFn),
             js_chakra_es2021_transform: opt!(b"JsChakraEs2021Transform"  as JsChakraEs2021TransformFn),
             _library: library,
         })
@@ -603,6 +657,7 @@ impl HostRuntime {
             api,
             runtime,
             color_enabled: supports_color(),
+            promise_state: Box::new(PromiseQueueState::new()),
             // Placeholder — real pointer patched in step 2.
             _print_state: Box::new(PrintCallbackState { api: ptr::null() }),
             _console_states: Vec::new(),
@@ -617,9 +672,10 @@ impl HostRuntime {
         host._print_state = Box::new(PrintCallbackState { api: api_ptr });
 
         // ── Step 3: install globals (uses the already-stable api_ptr / shared_ptr).
+        host.promise_state.api = api_ptr;
         host.install_print_with(api_ptr)?;
         host.install_console_with(api_ptr, shared_ptr)?;
-        host.try_install_chakra_system_require();
+        host.install_promise_continuation()?;
 
         Ok(host)
     }
@@ -646,6 +702,7 @@ impl HostRuntime {
         if rc != JS_NO_ERROR {
             return Err(self.report_script_failure("JsRun", rc).unwrap_err());
         }
+        self.drain_promise_queue()?;
         Ok(result)
     }
 
@@ -663,6 +720,45 @@ impl HostRuntime {
             Ok(s) if !s.is_empty() => s,
             _ => source.into(),
         }
+    }
+
+    fn install_promise_continuation(&self) -> Result<(), String> {
+        let Some(set_callback) = self.api.js_set_promise_continuation_callback else {
+            eprintln!("warning: JsSetPromiseContinuationCallback not available in this build");
+            return Ok(());
+        };
+
+        ensure_js_ok(
+            unsafe {
+                set_callback(
+                    PROMISE_CONTINUATION_CB,
+                    self.promise_state.as_ref() as *const PromiseQueueState as *mut c_void,
+                )
+            },
+            "JsSetPromiseContinuationCallback",
+        )
+    }
+
+    fn drain_promise_queue(&self) -> Result<(), String> {
+        loop {
+            let task = self.promise_state.pending.borrow_mut().pop_front();
+            let Some(task) = task else {
+                break;
+            };
+
+            let mut args = [unsafe { get_undefined(&self.api) }];
+            let mut result = ptr::null_mut();
+            let rc = unsafe {
+                (self.api.js_call_function)(task, args.as_mut_ptr(), 1, &mut result)
+            };
+            let _ = unsafe { (self.api.js_release)(task, ptr::null_mut()) };
+
+            if rc != JS_NO_ERROR {
+                return Err(self.report_script_failure("JsCallFunction(PromiseContinuation)", rc).unwrap_err());
+            }
+        }
+
+        Ok(())
     }
 
     // ── global function installers ───────────────────────────────────────────
@@ -736,20 +832,6 @@ impl HostRuntime {
         }
 
         self.set_property_on(global, "console", obj)
-    }
-
-    fn try_install_chakra_system_require(&self) {
-        let Some(install) = self.api.js_install_chakra_system_require else {
-            eprintln!("warning: JsInstallChakraSystemRequire not available in this build");
-            return;
-        };
-        let mut f = ptr::null_mut();
-        let rc = unsafe { install(&mut f) };
-        if rc != JS_NO_ERROR {
-            eprintln!("warning: JsInstallChakraSystemRequire failed: {}",
-                self.describe_current_exception()
-                    .unwrap_or_else(|| format_js_error("JsInstallChakraSystemRequire", rc)));
-        }
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

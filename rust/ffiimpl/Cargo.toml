@@ -1,0 +1,15 @@
+[package]
+name = "chakra-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true

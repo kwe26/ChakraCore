@@ -4,6 +4,8 @@
 //-------------------------------------------------------------------------------------------------------
 #include "JsrtPch.h"
 #include "ChakraCore.h"
+#include "ChakraFfi.h"
+#include "ChakraHttpServer.h"
 
 #ifdef __valid
 #undef __valid
@@ -11,16 +13,46 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <fstream>
+#include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <sys/stat.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
 
+// Forward declarations
+CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject);
+CHAKRA_API JsInstallHttpServer(_Out_opt_ JsValueRef* serverObject);
+CHAKRA_API JsInstallHttpServerMulti(_Out_opt_ JsValueRef* serverObject);
+
 namespace
 {
+    JsValueRef CHAKRA_CALLBACK HttpServerOnCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState);
+    JsValueRef CHAKRA_CALLBACK HttpServerEndCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState);
+
 #ifdef _WIN32
     typedef HMODULE RustLibraryHandle;
 #else
@@ -29,14 +61,22 @@ namespace
 
 #ifdef _WIN32
     const char* const kRustPackageLibraryName = "chakra_packages.dll";
+    const char* const kRustFfiLibraryName = "chakra_ffi.dll";
+    const char* const kRustHttpServerLibraryName = "chakra_httpserver.dll";
 #elif defined(__APPLE__)
     const char* const kRustPackageLibraryName = "libchakra_packages.dylib";
+    const char* const kRustFfiLibraryName = "libchakra_ffi.dylib";
+    const char* const kRustHttpServerLibraryName = "libchakra_httpserver.dylib";
 #else
     const char* const kRustPackageLibraryName = "libchakra_packages.so";
+    const char* const kRustFfiLibraryName = "libchakra_ffi.so";
+    const char* const kRustHttpServerLibraryName = "libchakra_httpserver.so";
 #endif
 
     const char* const kUnknownPackageMessage =
         "Unknown system package. Available modules: chakra:info, chakra:fs, chakra:reqwest, chakra:es2020, chakra:es2021.";
+
+    std::map<std::string, JsValueRef> g_requireFileModuleCache;
 
 #ifdef _WIN32
     typedef const char* (__cdecl *ChakraInfoVersionFn)();
@@ -50,6 +90,17 @@ namespace
     typedef char* (__cdecl *ChakraReqwestFetchTextFn)(const char*, const char*, const char*);
     typedef int (__cdecl *ChakraReqwestDownloadFetchParallelFn)(const char*, const char*, int);
     typedef char* (__cdecl *ChakraEsAnalyzeFn)(const char*);
+    typedef ChakraFfiHandle (__cdecl *ChakraFfiDlopenFn)(const uint8_t*, size_t);
+    typedef void* (__cdecl *ChakraFfiDlsymFn)(ChakraFfiHandle, const uint8_t*, size_t);
+    typedef int (__cdecl *ChakraFfiDlcloseFn)(ChakraFfiHandle);
+    typedef uint64_t (__cdecl *ChakraFfiCallFn)(void*, uint32_t, const uint64_t*);
+    typedef uint8_t* (__cdecl *ChakraFfiGetLastErrorFn)();
+    typedef void (__cdecl *ChakraFfiFreeStringFn)(uint8_t*);
+    typedef ChakraHttpServerHandle (__cdecl *ChakraHttpServeSingleFn)(uint16_t, const uint8_t*, size_t);
+    typedef ChakraHttpServerHandle (__cdecl *ChakraHttpServeMultiFn)(uint16_t, const uint8_t*, size_t, uint32_t);
+    typedef int (__cdecl *ChakraHttpStartFn)(ChakraHttpServerHandle);
+    typedef int (__cdecl *ChakraHttpOnRouteFn)(ChakraHttpServerHandle, const uint8_t*, size_t);
+    typedef int (__cdecl *ChakraHttpStopFn)(ChakraHttpServerHandle);
 #else
     typedef const char* (*ChakraInfoVersionFn)();
     typedef const char* (*ChakraLastErrorFn)();
@@ -62,6 +113,17 @@ namespace
     typedef char* (*ChakraReqwestFetchTextFn)(const char*, const char*, const char*);
     typedef int (*ChakraReqwestDownloadFetchParallelFn)(const char*, const char*, int);
     typedef char* (*ChakraEsAnalyzeFn)(const char*);
+    typedef ChakraFfiHandle (*ChakraFfiDlopenFn)(const uint8_t*, size_t);
+    typedef void* (*ChakraFfiDlsymFn)(ChakraFfiHandle, const uint8_t*, size_t);
+    typedef int (*ChakraFfiDlcloseFn)(ChakraFfiHandle);
+    typedef uint64_t (*ChakraFfiCallFn)(void*, uint32_t, const uint64_t*);
+    typedef uint8_t* (*ChakraFfiGetLastErrorFn)();
+    typedef void (*ChakraFfiFreeStringFn)(uint8_t*);
+    typedef ChakraHttpServerHandle (*ChakraHttpServeSingleFn)(uint16_t, const uint8_t*, size_t);
+    typedef ChakraHttpServerHandle (*ChakraHttpServeMultiFn)(uint16_t, const uint8_t*, size_t, uint32_t);
+    typedef int (*ChakraHttpStartFn)(ChakraHttpServerHandle);
+    typedef int (*ChakraHttpOnRouteFn)(ChakraHttpServerHandle, const uint8_t*, size_t);
+    typedef int (*ChakraHttpStopFn)(ChakraHttpServerHandle);
 #endif
 
     struct RustPackageApi
@@ -104,6 +166,56 @@ namespace
 
     std::once_flag g_rustPackageInitializeFlag;
 
+    struct FfiApi
+    {
+        bool initialized;
+        RustLibraryHandle library;
+        ChakraFfiDlopenFn dlopen;
+        ChakraFfiDlsymFn dlsym;
+        ChakraFfiDlcloseFn dlclose;
+        ChakraFfiCallFn call;
+        ChakraFfiGetLastErrorFn getLastError;
+        ChakraFfiFreeStringFn freeString;
+    };
+
+    FfiApi g_ffiApi =
+    {
+        false,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr
+    };
+
+    std::once_flag g_ffiInitializeFlag;
+
+    struct HttpServerApi
+    {
+        bool initialized;
+        RustLibraryHandle library;
+        ChakraHttpServeSingleFn serveSingle;
+        ChakraHttpServeMultiFn serveMulti;
+        ChakraHttpStartFn start;
+        ChakraHttpOnRouteFn onRoute;
+        ChakraHttpStopFn stop;
+    };
+
+    HttpServerApi g_httpServerApi =
+    {
+        false,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr
+    };
+
+    std::once_flag g_httpServerInitializeFlag;
+
     std::string JoinPath(const std::string& left, const std::string& right)
     {
         if (left.empty())
@@ -118,6 +230,198 @@ namespace
         }
 
         return left + "/" + right;
+    }
+
+    bool IsPathSeparator(const char ch)
+    {
+        return ch == '/' || ch == '\\';
+    }
+
+    bool IsAbsolutePathForRequire(const std::string& path)
+    {
+        if (path.empty())
+        {
+            return false;
+        }
+
+#ifdef _WIN32
+        if (path.length() >= 2 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':')
+        {
+            return true;
+        }
+
+        if (path.length() >= 2 && IsPathSeparator(path[0]) && IsPathSeparator(path[1]))
+        {
+            return true;
+        }
+#endif
+
+        return IsPathSeparator(path[0]);
+    }
+
+    bool HasExtension(const std::string& path)
+    {
+        const size_t separator = path.find_last_of("/\\");
+        const size_t dot = path.find_last_of('.');
+        return dot != std::string::npos && (separator == std::string::npos || dot > separator);
+    }
+
+    bool EndsWithCaseInsensitive(const std::string& value, const std::string& suffix)
+    {
+        if (suffix.length() > value.length())
+        {
+            return false;
+        }
+
+        const size_t offset = value.length() - suffix.length();
+        for (size_t i = 0; i < suffix.length(); ++i)
+        {
+            const int left = std::tolower(static_cast<unsigned char>(value[offset + i]));
+            const int right = std::tolower(static_cast<unsigned char>(suffix[i]));
+            if (left != right)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    std::string NormalizeRequireSpecifier(std::string specifier)
+    {
+        const std::string commaJsonSuffix = ",json";
+        if (EndsWithCaseInsensitive(specifier, commaJsonSuffix))
+        {
+            specifier = specifier.substr(0, specifier.length() - commaJsonSuffix.length()) + ".json";
+        }
+
+        return specifier;
+    }
+
+    std::string GetCurrentWorkingDirectoryString()
+    {
+        char cwd[2048];
+#ifdef _WIN32
+        if (_getcwd(cwd, static_cast<int>(_countof(cwd))) != nullptr)
+#else
+        if (getcwd(cwd, sizeof(cwd)) != nullptr)
+#endif
+        {
+            return std::string(cwd);
+        }
+
+        return std::string();
+    }
+
+    bool IsRegularFile(const char* path)
+    {
+        if (path == nullptr || path[0] == '\0')
+        {
+            return false;
+        }
+
+#ifdef _WIN32
+        struct _stat fileInfo;
+        if (_stat(path, &fileInfo) != 0)
+        {
+            return false;
+        }
+
+        return (fileInfo.st_mode & _S_IFREG) != 0;
+#else
+        struct stat fileInfo;
+        if (stat(path, &fileInfo) != 0)
+        {
+            return false;
+        }
+
+        return S_ISREG(fileInfo.st_mode);
+#endif
+    }
+
+    bool TryReadUtf8File(const std::string& path, std::string* contents)
+    {
+        if (contents == nullptr)
+        {
+            return false;
+        }
+
+        std::ifstream file(path.c_str(), std::ios::in | std::ios::binary);
+        if (!file.good())
+        {
+            return false;
+        }
+
+        std::ostringstream stream;
+        stream << file.rdbuf();
+        *contents = stream.str();
+        return true;
+    }
+
+    std::string EscapeForSingleQuotedJsString(const std::string& text)
+    {
+        std::string escaped;
+        escaped.reserve(text.length() + 8);
+        for (size_t i = 0; i < text.length(); ++i)
+        {
+            const char ch = text[i];
+            switch (ch)
+            {
+            case '\\': escaped += "\\\\"; break;
+            case '\'': escaped += "\\'"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\t': escaped += "\\t"; break;
+            default: escaped += ch; break;
+            }
+        }
+
+        return escaped;
+    }
+
+    bool TryResolveRequirePath(const std::string& rawSpecifier, const std::string& baseDirectory, std::string* resolvedFullPath)
+    {
+        if (resolvedFullPath == nullptr)
+        {
+            return false;
+        }
+
+        const std::string specifier = NormalizeRequireSpecifier(rawSpecifier);
+        std::string effectiveBaseDirectory = baseDirectory;
+        if (effectiveBaseDirectory.empty())
+        {
+            effectiveBaseDirectory = GetCurrentWorkingDirectoryString();
+        }
+
+        std::string candidatePath = specifier;
+        if (!IsAbsolutePathForRequire(specifier))
+        {
+            candidatePath = JoinPath(effectiveBaseDirectory, specifier);
+        }
+
+        std::vector<std::string> candidates;
+        if (HasExtension(candidatePath))
+        {
+            candidates.push_back(candidatePath);
+        }
+        else
+        {
+            candidates.push_back(candidatePath + ".js");
+            candidates.push_back(candidatePath + ".json");
+            candidates.push_back(JoinPath(candidatePath, "index.js"));
+            candidates.push_back(JoinPath(candidatePath, "index.json"));
+        }
+
+        for (std::vector<std::string>::const_iterator it = candidates.begin(); it != candidates.end(); ++it)
+        {
+            if (IsRegularFile(it->c_str()))
+            {
+                *resolvedFullPath = *it;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     bool TryGetEnvironmentVariableValue(const char* variableName, std::string* value)
@@ -258,6 +562,49 @@ namespace
         return candidates;
     }
 
+    std::vector<std::string> BuildNamedLibraryCandidates(const char* environmentVariableName, const char* libraryName, const char* repoRelativeDirectory)
+    {
+        std::vector<std::string> candidates;
+
+        if (environmentVariableName != nullptr && libraryName != nullptr)
+        {
+            std::string envPath;
+            if (TryGetEnvironmentVariableValue(environmentVariableName, &envPath))
+            {
+                candidates.push_back(envPath);
+                candidates.push_back(JoinPath(envPath, libraryName));
+            }
+        }
+
+        if (libraryName == nullptr)
+        {
+            return candidates;
+        }
+
+        std::string moduleDirectory;
+        if (GetCurrentModuleDirectory(&moduleDirectory))
+        {
+            candidates.push_back(JoinPath(moduleDirectory, libraryName));
+            if (repoRelativeDirectory != nullptr)
+            {
+                candidates.push_back(JoinPath(moduleDirectory, std::string("../../../../") + repoRelativeDirectory + libraryName));
+            }
+        }
+
+        std::string executableDirectory;
+        if (GetExecutableDirectory(&executableDirectory))
+        {
+            candidates.push_back(JoinPath(executableDirectory, libraryName));
+            if (repoRelativeDirectory != nullptr)
+            {
+                candidates.push_back(JoinPath(executableDirectory, std::string("../../../../") + repoRelativeDirectory + libraryName));
+            }
+        }
+
+        candidates.push_back(libraryName);
+        return candidates;
+    }
+
     RustLibraryHandle TryLoadLibrary(const std::string& libraryPath)
     {
         if (libraryPath.empty())
@@ -338,6 +685,262 @@ namespace
             TryResolveSymbol(g_rustPackageApi.library, "chakra_es2021_analyze"));
         g_rustPackageApi.es2021Transform = reinterpret_cast<ChakraEsAnalyzeFn>(
             TryResolveSymbol(g_rustPackageApi.library, "chakra_es2021_transform"));
+    }
+
+    void InitializeFfiApi()
+    {
+        if (g_ffiApi.initialized)
+        {
+            return;
+        }
+
+        g_ffiApi.initialized = true;
+
+        // Prefer symbols from chakra_packages so existing deployments work without
+        // requiring a separate chakra_ffi shared library.
+        if (g_rustPackageApi.library == nullptr)
+        {
+            std::call_once(g_rustPackageInitializeFlag, InitializeRustPackageApi);
+        }
+
+        if (g_rustPackageApi.library != nullptr)
+        {
+            g_ffiApi.library = g_rustPackageApi.library;
+            g_ffiApi.dlopen = reinterpret_cast<ChakraFfiDlopenFn>(
+                TryResolveSymbol(g_ffiApi.library, "chakra_ffi_dlopen"));
+            g_ffiApi.dlsym = reinterpret_cast<ChakraFfiDlsymFn>(
+                TryResolveSymbol(g_ffiApi.library, "chakra_ffi_dlsym"));
+            g_ffiApi.dlclose = reinterpret_cast<ChakraFfiDlcloseFn>(
+                TryResolveSymbol(g_ffiApi.library, "chakra_ffi_dlclose"));
+            g_ffiApi.call = reinterpret_cast<ChakraFfiCallFn>(
+                TryResolveSymbol(g_ffiApi.library, "chakra_ffi_call"));
+            g_ffiApi.getLastError = reinterpret_cast<ChakraFfiGetLastErrorFn>(
+                TryResolveSymbol(g_ffiApi.library, "chakra_ffi_get_last_error"));
+            g_ffiApi.freeString = reinterpret_cast<ChakraFfiFreeStringFn>(
+                TryResolveSymbol(g_ffiApi.library, "chakra_ffi_free_string"));
+
+            if (g_ffiApi.dlopen != nullptr &&
+                g_ffiApi.dlsym != nullptr &&
+                g_ffiApi.dlclose != nullptr &&
+                g_ffiApi.call != nullptr)
+            {
+                return;
+            }
+
+            // Reset and try dedicated library candidates.
+            g_ffiApi.library = nullptr;
+            g_ffiApi.dlopen = nullptr;
+            g_ffiApi.dlsym = nullptr;
+            g_ffiApi.dlclose = nullptr;
+            g_ffiApi.call = nullptr;
+            g_ffiApi.getLastError = nullptr;
+            g_ffiApi.freeString = nullptr;
+        }
+
+        const std::vector<std::string> candidates = BuildNamedLibraryCandidates(
+            "CHAKRA_RUST_FFI_PATH",
+            kRustFfiLibraryName,
+            "rust/ffiimpl/target/release/");
+        for (std::vector<std::string>::const_iterator candidate = candidates.begin();
+            candidate != candidates.end();
+            ++candidate)
+        {
+            g_ffiApi.library = TryLoadLibrary(*candidate);
+            if (g_ffiApi.library != nullptr)
+            {
+                break;
+            }
+        }
+
+        if (g_ffiApi.library == nullptr)
+        {
+            return;
+        }
+
+        g_ffiApi.dlopen = reinterpret_cast<ChakraFfiDlopenFn>(
+            TryResolveSymbol(g_ffiApi.library, "chakra_ffi_dlopen"));
+        g_ffiApi.dlsym = reinterpret_cast<ChakraFfiDlsymFn>(
+            TryResolveSymbol(g_ffiApi.library, "chakra_ffi_dlsym"));
+        g_ffiApi.dlclose = reinterpret_cast<ChakraFfiDlcloseFn>(
+            TryResolveSymbol(g_ffiApi.library, "chakra_ffi_dlclose"));
+        g_ffiApi.call = reinterpret_cast<ChakraFfiCallFn>(
+            TryResolveSymbol(g_ffiApi.library, "chakra_ffi_call"));
+        g_ffiApi.getLastError = reinterpret_cast<ChakraFfiGetLastErrorFn>(
+            TryResolveSymbol(g_ffiApi.library, "chakra_ffi_get_last_error"));
+        g_ffiApi.freeString = reinterpret_cast<ChakraFfiFreeStringFn>(
+            TryResolveSymbol(g_ffiApi.library, "chakra_ffi_free_string"));
+    }
+
+    bool EnsureFfiApiLoaded(std::string* errorMessage)
+    {
+        std::call_once(g_ffiInitializeFlag, InitializeFfiApi);
+
+        if (g_ffiApi.library == nullptr)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Unable to load chakra_ffi shared library. Set CHAKRA_RUST_FFI_PATH to the library path or containing directory.";
+            }
+
+            return false;
+        }
+
+        if (g_ffiApi.dlopen == nullptr || g_ffiApi.dlsym == nullptr || g_ffiApi.dlclose == nullptr || g_ffiApi.call == nullptr)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "chakra_ffi shared library is missing required exports.";
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    void SetFfiErrorMessage(std::string* errorMessage, const char* fallbackMessage)
+    {
+        if (errorMessage == nullptr)
+        {
+            return;
+        }
+
+        if (g_ffiApi.getLastError != nullptr)
+        {
+            uint8_t* lastError = g_ffiApi.getLastError();
+            if (lastError != nullptr)
+            {
+                if (lastError[0] != '\0')
+                {
+                    *errorMessage = reinterpret_cast<const char*>(lastError);
+                    if (g_ffiApi.freeString != nullptr)
+                    {
+                        g_ffiApi.freeString(lastError);
+                    }
+                    return;
+                }
+
+                if (g_ffiApi.freeString != nullptr)
+                {
+                    g_ffiApi.freeString(lastError);
+                }
+            }
+        }
+
+        if (fallbackMessage != nullptr)
+        {
+            *errorMessage = fallbackMessage;
+        }
+        else
+        {
+            errorMessage->clear();
+        }
+    }
+
+    void InitializeHttpServerApi()
+    {
+        if (g_httpServerApi.initialized)
+        {
+            return;
+        }
+
+        g_httpServerApi.initialized = true;
+
+        // Prefer symbols from chakra_packages so existing deployments work without
+        // requiring a separate chakra_httpserver shared library.
+        if (g_rustPackageApi.library == nullptr)
+        {
+            std::call_once(g_rustPackageInitializeFlag, InitializeRustPackageApi);
+        }
+
+        if (g_rustPackageApi.library != nullptr)
+        {
+            g_httpServerApi.library = g_rustPackageApi.library;
+            g_httpServerApi.serveSingle = reinterpret_cast<ChakraHttpServeSingleFn>(
+                TryResolveSymbol(g_httpServerApi.library, "chakra_http_serve_single"));
+            g_httpServerApi.serveMulti = reinterpret_cast<ChakraHttpServeMultiFn>(
+                TryResolveSymbol(g_httpServerApi.library, "chakra_http_serve_multi"));
+            g_httpServerApi.start = reinterpret_cast<ChakraHttpStartFn>(
+                TryResolveSymbol(g_httpServerApi.library, "chakra_http_start"));
+            g_httpServerApi.onRoute = reinterpret_cast<ChakraHttpOnRouteFn>(
+                TryResolveSymbol(g_httpServerApi.library, "chakra_http_on_route"));
+            g_httpServerApi.stop = reinterpret_cast<ChakraHttpStopFn>(
+                TryResolveSymbol(g_httpServerApi.library, "chakra_http_stop"));
+
+            if (g_httpServerApi.serveSingle != nullptr &&
+                g_httpServerApi.serveMulti != nullptr &&
+                g_httpServerApi.start != nullptr &&
+                g_httpServerApi.stop != nullptr)
+            {
+                return;
+            }
+
+            // Reset and try dedicated library candidates.
+            g_httpServerApi.library = nullptr;
+            g_httpServerApi.serveSingle = nullptr;
+            g_httpServerApi.serveMulti = nullptr;
+            g_httpServerApi.start = nullptr;
+            g_httpServerApi.onRoute = nullptr;
+            g_httpServerApi.stop = nullptr;
+        }
+
+        const std::vector<std::string> candidates = BuildNamedLibraryCandidates(
+            "CHAKRA_RUST_HTTP_SERVER_PATH",
+            kRustHttpServerLibraryName,
+            "rust/httpserver/target/release/");
+        for (std::vector<std::string>::const_iterator candidate = candidates.begin();
+            candidate != candidates.end();
+            ++candidate)
+        {
+            g_httpServerApi.library = TryLoadLibrary(*candidate);
+            if (g_httpServerApi.library != nullptr)
+            {
+                break;
+            }
+        }
+
+        if (g_httpServerApi.library == nullptr)
+        {
+            return;
+        }
+
+        g_httpServerApi.serveSingle = reinterpret_cast<ChakraHttpServeSingleFn>(
+            TryResolveSymbol(g_httpServerApi.library, "chakra_http_serve_single"));
+        g_httpServerApi.serveMulti = reinterpret_cast<ChakraHttpServeMultiFn>(
+            TryResolveSymbol(g_httpServerApi.library, "chakra_http_serve_multi"));
+        g_httpServerApi.start = reinterpret_cast<ChakraHttpStartFn>(
+            TryResolveSymbol(g_httpServerApi.library, "chakra_http_start"));
+        g_httpServerApi.onRoute = reinterpret_cast<ChakraHttpOnRouteFn>(
+            TryResolveSymbol(g_httpServerApi.library, "chakra_http_on_route"));
+        g_httpServerApi.stop = reinterpret_cast<ChakraHttpStopFn>(
+            TryResolveSymbol(g_httpServerApi.library, "chakra_http_stop"));
+    }
+
+    bool EnsureHttpServerApiLoaded(std::string* errorMessage)
+    {
+        std::call_once(g_httpServerInitializeFlag, InitializeHttpServerApi);
+
+        if (g_httpServerApi.library == nullptr)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "Unable to load chakra_httpserver shared library. Set CHAKRA_RUST_HTTP_SERVER_PATH to the library path or containing directory.";
+            }
+
+            return false;
+        }
+
+        if (g_httpServerApi.serveSingle == nullptr || g_httpServerApi.serveMulti == nullptr || g_httpServerApi.start == nullptr || g_httpServerApi.stop == nullptr)
+        {
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = "chakra_httpserver shared library is missing required exports.";
+            }
+
+            return false;
+        }
+
+        return true;
     }
 
     bool EnsureRustPackageApiLoaded(std::string* errorMessage)
@@ -887,6 +1490,97 @@ namespace
         }
 
         return ConvertValueToUtf8String(arguments[1], sourceText);
+    }
+
+    JsErrorCode EvaluateJavascriptModule(const std::string& modulePath, const std::string& moduleSource, JsValueRef* moduleExports)
+    {
+        if (moduleExports == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        std::string moduleDirectory;
+        if (!GetDirectoryFromFullPath(modulePath, &moduleDirectory))
+        {
+            moduleDirectory = GetCurrentWorkingDirectoryString();
+        }
+
+        std::string wrappedSource =
+            "(function(){"
+            "var __filename='" + EscapeForSingleQuotedJsString(modulePath) + "';"
+            "var __dirname='" + EscapeForSingleQuotedJsString(moduleDirectory) + "';"
+            "var module={exports:{}};"
+            "var exports=module.exports;"
+            "var requireLocal=function(p){return require(p,__dirname);};"
+            "(function(exports,require,module,__filename,__dirname){\n" +
+            moduleSource +
+            "\n})(exports,requireLocal,module,__filename,__dirname);"
+            "return module.exports;"
+            "})()";
+
+        JsValueRef scriptValue = JS_INVALID_REFERENCE;
+        JsErrorCode errorCode = JsCreateString(wrappedSource.c_str(), wrappedSource.length(), &scriptValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsValueRef sourceNameValue = JS_INVALID_REFERENCE;
+        errorCode = JsCreateString(modulePath.c_str(), modulePath.length(), &sourceNameValue);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        return JsRun(scriptValue, JS_SOURCE_CONTEXT_NONE, sourceNameValue, JsParseScriptAttributeNone, moduleExports);
+    }
+
+    JsErrorCode LoadFileModule(const std::string& rawSpecifier, const std::string& baseDirectory, JsValueRef* moduleValue)
+    {
+        if (moduleValue == nullptr)
+        {
+            return JsErrorInvalidArgument;
+        }
+
+        *moduleValue = JS_INVALID_REFERENCE;
+
+        std::string resolvedPath;
+        if (!TryResolveRequirePath(rawSpecifier, baseDirectory, &resolvedPath))
+        {
+            return SetExceptionFromUtf8("Cannot find module '" + rawSpecifier + "'.");
+        }
+
+        std::map<std::string, JsValueRef>::const_iterator cacheEntry = g_requireFileModuleCache.find(resolvedPath);
+        if (cacheEntry != g_requireFileModuleCache.end())
+        {
+            *moduleValue = cacheEntry->second;
+            return JsNoError;
+        }
+
+        std::string sourceText;
+        if (!TryReadUtf8File(resolvedPath, &sourceText))
+        {
+            return SetExceptionFromUtf8("Failed to read module file '" + resolvedPath + "'.");
+        }
+
+        JsErrorCode errorCode = JsNoError;
+        if (EndsWithCaseInsensitive(resolvedPath, ".json"))
+        {
+            errorCode = ParseJsonText(sourceText, moduleValue);
+        }
+        else
+        {
+            errorCode = EvaluateJavascriptModule(resolvedPath, sourceText, moduleValue);
+        }
+
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+
+        JsAddRef(*moduleValue, nullptr);
+        g_requireFileModuleCache[resolvedPath] = *moduleValue;
+        return JsNoError;
     }
 
     JsErrorCode CreateSystemPackageObject(const std::string& moduleName, JsValueRef* packageObject);
@@ -1517,15 +2211,291 @@ namespace
             return JS_INVALID_REFERENCE;
         }
 
-        JsValueRef packageObject = JS_INVALID_REFERENCE;
-        const JsErrorCode createError = CreateSystemPackageObject(moduleName, &packageObject);
-        if (createError != JsNoError)
+        if (moduleName.length() >= 7 && moduleName.compare(0, 7, "chakra:") == 0)
         {
-            return SetExceptionAndReturnInvalidReference(kUnknownPackageMessage);
+            JsValueRef packageObject = JS_INVALID_REFERENCE;
+            const JsErrorCode createError = CreateSystemPackageObject(moduleName, &packageObject);
+            if (createError != JsNoError)
+            {
+                return SetExceptionAndReturnInvalidReference(kUnknownPackageMessage);
+            }
+
+            return packageObject;
         }
 
-        return packageObject;
+        std::string baseDirectory;
+        if (argumentCount > 2)
+        {
+            JsValueType baseType = JsUndefined;
+            if (JsGetValueType(arguments[2], &baseType) == JsNoError && baseType != JsUndefined && baseType != JsNull)
+            {
+                const JsErrorCode baseError = ConvertValueToUtf8String(arguments[2], &baseDirectory);
+                if (baseError != JsNoError)
+                {
+                    return JS_INVALID_REFERENCE;
+                }
+            }
+        }
+
+        JsValueRef moduleValue = JS_INVALID_REFERENCE;
+        const JsErrorCode loadError = LoadFileModule(moduleName, baseDirectory, &moduleValue);
+        if (loadError != JsNoError)
+        {
+            return JS_INVALID_REFERENCE;
+        }
+
+        return moduleValue;
     }
+
+    // ── FFI Support ───────────────────────────────────────────────────────────
+
+    JsValueRef CHAKRA_CALLBACK FfiDlopenCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 2)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.dlopen requires a path string");
+        }
+
+        std::string pathStr;
+        if (ConvertValueToUtf8String(arguments[1], &pathStr) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.dlopen: path must be a string");
+        }
+
+        std::string errorMessage;
+        if (!EnsureFfiApiLoaded(&errorMessage))
+        {
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        ChakraFfiHandle handle = g_ffiApi.dlopen(
+            reinterpret_cast<const uint8_t*>(pathStr.c_str()),
+            pathStr.length()
+        );
+
+        if (chakra_ffi_handle_is_null(handle))
+        {
+            SetFfiErrorMessage(&errorMessage, "ffi.dlopen: failed to load library");
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        JsValueRef handleObj = JS_INVALID_REFERENCE;
+        JsCreateObject(&handleObj);
+        
+        JsValueRef handleValue = JS_INVALID_REFERENCE;
+        JsDoubleToNumber(static_cast<double>(handle.handle), &handleValue);
+        SetPropertyByName(handleObj, "handle", handleValue);
+
+        return handleObj;
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiDlsymCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 3)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.dlsym requires (handle, symbol)");
+        }
+
+        double handleNum = 0.0;
+        if (JsNumberToDouble(arguments[1], &handleNum) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.dlsym: handle must be a number");
+        }
+
+        std::string symbolStr;
+        if (ConvertValueToUtf8String(arguments[2], &symbolStr) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.dlsym: symbol must be a string");
+        }
+
+        ChakraFfiHandle handle;
+        handle.handle = static_cast<uint64_t>(handleNum);
+
+        std::string errorMessage;
+        if (!EnsureFfiApiLoaded(&errorMessage))
+        {
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        void* funcPtr = g_ffiApi.dlsym(
+            handle,
+            reinterpret_cast<const uint8_t*>(symbolStr.c_str()),
+            symbolStr.length() + 1
+        );
+
+        if (funcPtr == nullptr)
+        {
+            SetFfiErrorMessage(&errorMessage, "ffi.dlsym: symbol not found");
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        JsValueRef ptrObj = JS_INVALID_REFERENCE;
+        JsCreateObject(&ptrObj);
+
+        JsValueRef ptrValue = JS_INVALID_REFERENCE;
+        JsDoubleToNumber(static_cast<double>(reinterpret_cast<uintptr_t>(funcPtr)), &ptrValue);
+        SetPropertyByName(ptrObj, "ptr", ptrValue);
+
+        return ptrObj;
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiCallCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 2)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.call requires (funcPtr, args)");
+        }
+
+        double ptrNum = 0.0;
+        if (JsNumberToDouble(arguments[1], &ptrNum) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.call: funcPtr must be a number");
+        }
+
+        void* funcPtr = reinterpret_cast<void*>(static_cast<uintptr_t>(ptrNum));
+
+        // Collect arguments array
+        uint64_t callArgs[8] = {0};
+        uint32_t argc = 0;
+
+        if (argumentCount > 2)
+        {
+            JsValueType argsType = JsUndefined;
+            if (JsGetValueType(arguments[2], &argsType) == JsNoError && argsType == JsArray)
+            {
+                JsValueRef lengthProp = JS_INVALID_REFERENCE;
+                if (GetPropertyByName(arguments[2], "length", &lengthProp) == JsNoError)
+                {
+                    double len = 0.0;
+                    if (JsNumberToDouble(lengthProp, &len) == JsNoError)
+                    {
+                        argc = static_cast<uint32_t>(len > 8 ? 8 : len);
+                        for (uint32_t i = 0; i < argc; ++i)
+                        {
+                            JsValueRef elem = JS_INVALID_REFERENCE;
+                            std::string indexStr = std::to_string(i);
+                            if (GetPropertyByName(arguments[2], indexStr.c_str(), &elem) == JsNoError)
+                            {
+                                double val = 0.0;
+                                JsNumberToDouble(elem, &val);
+                                callArgs[i] = static_cast<uint64_t>(val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        std::string errorMessage;
+        if (!EnsureFfiApiLoaded(&errorMessage))
+        {
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        uint64_t result = g_ffiApi.call(funcPtr, argc, callArgs);
+
+        JsValueRef resultValue = JS_INVALID_REFERENCE;
+        JsDoubleToNumber(static_cast<double>(result), &resultValue);
+        return resultValue;
+    }
+
+    JsValueRef CHAKRA_CALLBACK FfiCloseCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+    {
+        UNREFERENCED_PARAMETER(callee);
+        UNREFERENCED_PARAMETER(isConstructCall);
+        UNREFERENCED_PARAMETER(callbackState);
+
+        if (argumentCount < 2)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.close requires a handle");
+        }
+
+        double handleNum = 0.0;
+        if (JsNumberToDouble(arguments[1], &handleNum) != JsNoError)
+        {
+            return SetExceptionAndReturnInvalidReference("ffi.close: handle must be a number");
+        }
+
+        ChakraFfiHandle handle;
+        handle.handle = static_cast<uint64_t>(handleNum);
+
+        std::string errorMessage;
+        if (!EnsureFfiApiLoaded(&errorMessage))
+        {
+            return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+        }
+
+        int result = g_ffiApi.dlclose(handle);
+
+        JsValueRef resultValue = JS_INVALID_REFERENCE;
+        JsDoubleToNumber(static_cast<double>(result), &resultValue);
+        return resultValue;
+    }
+}
+
+CHAKRA_API JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction);
+
+JsErrorCode JsEnsureChakraSystemRequireIfMissing()
+{
+    JsValueRef globalObject = JS_INVALID_REFERENCE;
+    JsErrorCode errorCode = JsGetGlobalObject(&globalObject);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    JsValueRef existingRequire = JS_INVALID_REFERENCE;
+    errorCode = GetPropertyByName(globalObject, "require", &existingRequire);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    JsValueType requireType = JsUndefined;
+    errorCode = JsGetValueType(existingRequire, &requireType);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    if (requireType != JsUndefined)
+    {
+        return JsNoError;
+    }
+
+    return JsInstallChakraSystemRequire(nullptr);
 }
 
 CHAKRA_API JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction)
@@ -1558,6 +2528,324 @@ CHAKRA_API JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction)
     return JsNoError;
 }
 
+JsErrorCode JsEnsureFfiIfMissing()
+{
+    JsValueRef globalObject = JS_INVALID_REFERENCE;
+    JsErrorCode errorCode = JsGetGlobalObject(&globalObject);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    JsValueRef existingFfi = JS_INVALID_REFERENCE;
+    errorCode = GetPropertyByName(globalObject, "ffi", &existingFfi);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    JsValueType ffiType = JsUndefined;
+    errorCode = JsGetValueType(existingFfi, &ffiType);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    if (ffiType != JsUndefined)
+    {
+        return JsNoError;
+    }
+
+    return JsInstallFfi(nullptr);
+}
+
+JsErrorCode JsEnsureHttpServerIfMissing()
+{
+    JsValueRef globalObject = JS_INVALID_REFERENCE;
+    JsErrorCode errorCode = JsGetGlobalObject(&globalObject);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Check if cHttp exists
+    JsValueRef existingCHttp = JS_INVALID_REFERENCE;
+    errorCode = GetPropertyByName(globalObject, "cHttp", &existingCHttp);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    JsValueType cHttpType = JsUndefined;
+    errorCode = JsGetValueType(existingCHttp, &cHttpType);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    if (cHttpType == JsUndefined)
+    {
+        errorCode = JsInstallHttpServer(nullptr);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+    }
+
+    // Check if cHttpK exists
+    JsValueRef existingCHttpK = JS_INVALID_REFERENCE;
+    errorCode = GetPropertyByName(globalObject, "cHttpK", &existingCHttpK);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    JsValueType cHttpKType = JsUndefined;
+    errorCode = JsGetValueType(existingCHttpK, &cHttpKType);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    if (cHttpKType == JsUndefined)
+    {
+        errorCode = JsInstallHttpServerMulti(nullptr);
+        if (errorCode != JsNoError)
+        {
+            return errorCode;
+        }
+    }
+
+    return JsNoError;
+}
+
+// ── HTTP Server Support ───────────────────────────────────────────────────────
+
+namespace
+{
+    // Store routes and event handlers per server instance
+    struct HttpServerState
+    {
+        uint64_t serverId;
+        std::map<std::string, JsValueRef> routeHandlers; // "GET:/" -> handler function
+        std::map<std::string, JsValueRef> eventHandlers; // "get", "post", etc.
+    };
+
+    std::map<uint64_t, HttpServerState> g_httpServers;
+    uint64_t g_nextHttpServerId = 1;
+
+    JsValueRef CHAKRA_CALLBACK HttpServerServeCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+{
+    UNREFERENCED_PARAMETER(callee);
+    UNREFERENCED_PARAMETER(isConstructCall);
+    UNREFERENCED_PARAMETER(callbackState);
+
+    if (argumentCount < 3)
+    {
+        return SetExceptionAndReturnInvalidReference("serve requires (port, host, [threads])");
+    }
+
+    double port = 0.0;
+    if (JsNumberToDouble(arguments[1], &port) != JsNoError)
+    {
+        return SetExceptionAndReturnInvalidReference("serve: port must be a number");
+    }
+
+    std::string host;
+    if (ConvertValueToUtf8String(arguments[2], &host) != JsNoError)
+    {
+        return SetExceptionAndReturnInvalidReference("serve: host must be a string");
+    }
+
+    uint32_t threadCount = 1;
+    if (argumentCount > 3)
+    {
+        double threads = 0.0;
+        if (JsNumberToDouble(arguments[3], &threads) == JsNoError && threads > 0)
+        {
+            threadCount = static_cast<uint32_t>(threads);
+        }
+    }
+
+    std::string errorMessage;
+    if (!EnsureHttpServerApiLoaded(&errorMessage))
+    {
+        return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+    }
+
+    ChakraHttpServerHandle serverHandle = (argumentCount > 3 && threadCount > 1)
+        ? g_httpServerApi.serveMulti(
+            static_cast<uint16_t>(port),
+            reinterpret_cast<const uint8_t*>(host.c_str()),
+            host.length(),
+            threadCount)
+        : g_httpServerApi.serveSingle(
+            static_cast<uint16_t>(port),
+            reinterpret_cast<const uint8_t*>(host.c_str()),
+            host.length());
+
+    if (chakra_http_server_handle_is_null(serverHandle))
+    {
+        return SetExceptionAndReturnInvalidReference("Failed to create HTTP server");
+    }
+
+    if (g_httpServerApi.start(serverHandle) == 0)
+    {
+        return SetExceptionAndReturnInvalidReference("Failed to start HTTP server");
+    }
+
+    JsValueRef serverObj = JS_INVALID_REFERENCE;
+    JsCreateObject(&serverObj);
+
+    // Store server handle
+    JsValueRef handleValue = JS_INVALID_REFERENCE;
+    JsDoubleToNumber(static_cast<double>(serverHandle.id), &handleValue);
+    SetPropertyByName(serverObj, "_handle", handleValue);
+
+    // Store route handlers map
+    JsValueRef routesObj = JS_INVALID_REFERENCE;
+    JsCreateObject(&routesObj);
+    SetPropertyByName(serverObj, "_routes", routesObj);
+
+    // Install on method
+    JsValueRef onFunc = JS_INVALID_REFERENCE;
+    JsCreateFunction(HttpServerOnCallback, serverObj, &onFunc);
+    SetPropertyByName(serverObj, "on", onFunc);
+
+    // Install end method
+    JsValueRef endFunc = JS_INVALID_REFERENCE;
+    JsCreateFunction(HttpServerEndCallback, serverObj, &endFunc);
+    SetPropertyByName(serverObj, "end", endFunc);
+
+    return serverObj;
+}
+
+JsValueRef CHAKRA_CALLBACK HttpServerOnCallback(
+    _In_ JsValueRef callee,
+    _In_ bool isConstructCall,
+    _In_ JsValueRef *arguments,
+    _In_ unsigned short argumentCount,
+    _In_opt_ void *callbackState)
+{
+    UNREFERENCED_PARAMETER(callee);
+    UNREFERENCED_PARAMETER(isConstructCall);
+    UNREFERENCED_PARAMETER(callbackState);
+
+    if (argumentCount < 4)
+    {
+        return SetExceptionAndReturnInvalidReference("on requires (method, path, handler)");
+    }
+
+    std::string method;
+    if (ConvertValueToUtf8String(arguments[1], &method) != JsNoError)
+    {
+        return SetExceptionAndReturnInvalidReference("on: method must be a string");
+    }
+
+    std::string path;
+    if (ConvertValueToUtf8String(arguments[2], &path) != JsNoError)
+    {
+        return SetExceptionAndReturnInvalidReference("on: path must be a string");
+    }
+
+    std::string errorMessage;
+    if (!EnsureHttpServerApiLoaded(&errorMessage))
+    {
+        return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+    }
+
+    JsValueType handlerType = JsUndefined;
+    if (JsGetValueType(arguments[3], &handlerType) != JsNoError || handlerType != JsFunction)
+    {
+        return SetExceptionAndReturnInvalidReference("on: handler must be a function");
+    }
+
+    // Store route handler for later use
+    std::string routeKey = method + ":" + path;
+
+    JsValueRef handleValue = JS_INVALID_REFERENCE;
+    if (GetPropertyByName(arguments[0], "_handle", &handleValue) != JsNoError)
+    {
+        return SetExceptionAndReturnInvalidReference("Invalid server object");
+    }
+
+    double handleNum = 0.0;
+    if (JsNumberToDouble(handleValue, &handleNum) != JsNoError)
+    {
+        return SetExceptionAndReturnInvalidReference("Invalid server handle");
+    }
+
+    ChakraHttpServerHandle handle;
+    handle.id = static_cast<uint64_t>(handleNum);
+
+    if (g_httpServerApi.onRoute != nullptr &&
+        g_httpServerApi.onRoute(
+            handle,
+            reinterpret_cast<const uint8_t*>(routeKey.c_str()),
+            routeKey.length()) == 0)
+    {
+        return SetExceptionAndReturnInvalidReference("on: failed to register route");
+    }
+    
+    // In a real implementation, this would be stored and called when requests come in
+    // For now, we just acknowledge registration
+    
+    JsValueRef undef = JS_INVALID_REFERENCE;
+    JsGetUndefinedValue(&undef);
+    return undef; // Return undefined on success
+    }
+
+    JsValueRef CHAKRA_CALLBACK HttpServerEndCallback(
+        _In_ JsValueRef callee,
+        _In_ bool isConstructCall,
+        _In_ JsValueRef *arguments,
+        _In_ unsigned short argumentCount,
+        _In_opt_ void *callbackState)
+{
+    UNREFERENCED_PARAMETER(callee);
+    UNREFERENCED_PARAMETER(isConstructCall);
+    UNREFERENCED_PARAMETER(callbackState);
+
+    if (argumentCount < 1)
+    {
+        return SetExceptionAndReturnInvalidReference("end requires context");
+    }
+
+    JsValueRef serverObj = arguments[0];
+    JsValueRef handleValue = JS_INVALID_REFERENCE;
+    if (GetPropertyByName(serverObj, "_handle", &handleValue) != JsNoError)
+    {
+        return SetExceptionAndReturnInvalidReference("Invalid server object");
+    }
+
+    double handleNum = 0.0;
+    if (JsNumberToDouble(handleValue, &handleNum) != JsNoError)
+    {
+        return SetExceptionAndReturnInvalidReference("Invalid server handle");
+    }
+
+    ChakraHttpServerHandle handle;
+    handle.id = static_cast<uint64_t>(handleNum);
+
+    std::string errorMessage;
+    if (!EnsureHttpServerApiLoaded(&errorMessage))
+    {
+        return SetExceptionAndReturnInvalidReference(errorMessage.c_str());
+    }
+
+    int result = g_httpServerApi.stop(handle);
+    
+    JsValueRef resultValue = JS_INVALID_REFERENCE;
+    JsDoubleToNumber(static_cast<double>(result), &resultValue);
+    return resultValue;
+    }
+}
+
 CHAKRA_API JsRequireChakraSystemPackage(_In_ JsValueRef moduleName, _Out_ JsValueRef* packageObject)
 {
     if (packageObject == nullptr)
@@ -1581,6 +2869,177 @@ CHAKRA_API JsRequireChakraSystemPackage(_In_ JsValueRef moduleName, _Out_ JsValu
     }
 
     return errorCode;
+}
+
+CHAKRA_API JsInstallFfi(_Out_opt_ JsValueRef* ffiObject)
+{
+    JsValueRef ffiObj = JS_INVALID_REFERENCE;
+    JsErrorCode errorCode = JsCreateObject(&ffiObj);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.dlopen
+    JsValueRef dlopenFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiDlopenCallback, nullptr, &dlopenFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "dlopen", dlopenFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.dlsym
+    JsValueRef dlsymFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiDlsymCallback, nullptr, &dlsymFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "dlsym", dlsymFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.call
+    JsValueRef callFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiCallCallback, nullptr, &callFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "call", callFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi.close
+    JsValueRef closeFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(FfiCloseCallback, nullptr, &closeFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(ffiObj, "close", closeFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install ffi object on global scope
+    JsValueRef globalObject = JS_INVALID_REFERENCE;
+    errorCode = JsGetGlobalObject(&globalObject);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    errorCode = SetPropertyByName(globalObject, "ffi", ffiObj);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    if (ffiObject != nullptr)
+    {
+        *ffiObject = ffiObj;
+    }
+
+    return JsNoError;
+}
+
+CHAKRA_API JsInstallHttpServer(_Out_opt_ JsValueRef* serverObject)
+{
+    JsValueRef serverObj = JS_INVALID_REFERENCE;
+    JsErrorCode errorCode = JsCreateObject(&serverObj);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install serve method
+    JsValueRef serveFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(HttpServerServeCallback, nullptr, &serveFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(serverObj, "serve", serveFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install cHttp on global scope
+    JsValueRef globalObject = JS_INVALID_REFERENCE;
+    errorCode = JsGetGlobalObject(&globalObject);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    errorCode = SetPropertyByName(globalObject, "cHttp", serverObj);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    if (serverObject != nullptr)
+    {
+        *serverObject = serverObj;
+    }
+
+    return JsNoError;
+}
+
+CHAKRA_API JsInstallHttpServerMulti(_Out_opt_ JsValueRef* serverObject)
+{
+    JsValueRef serverObj = JS_INVALID_REFERENCE;
+    JsErrorCode errorCode = JsCreateObject(&serverObj);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install serve method (multi-threaded version)
+    JsValueRef serveFunc = JS_INVALID_REFERENCE;
+    errorCode = JsCreateFunction(HttpServerServeCallback, nullptr, &serveFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+    errorCode = SetPropertyByName(serverObj, "serve", serveFunc);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    // Install cHttpK on global scope
+    JsValueRef globalObject = JS_INVALID_REFERENCE;
+    errorCode = JsGetGlobalObject(&globalObject);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    errorCode = SetPropertyByName(globalObject, "cHttpK", serverObj);
+    if (errorCode != JsNoError)
+    {
+        return errorCode;
+    }
+
+    if (serverObject != nullptr)
+    {
+        *serverObject = serverObj;
+    }
+
+    return JsNoError;
 }
 
 CHAKRA_API JsChakraEs2020Analyze(_In_ JsValueRef source, _Out_ JsValueRef* analysisResult)

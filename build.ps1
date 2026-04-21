@@ -170,6 +170,44 @@ function Invoke-RustPackageBuild {
     Write-Host "Using CHAKRA_RUST_PACKAGES_PATH=$env:CHAKRA_RUST_PACKAGES_PATH"
 }
 
+function Invoke-RustNativeExtensionBuild {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRelativePath,
+        [Parameter(Mandatory = $true)][string]$EnvironmentVariableName,
+        [Parameter(Mandatory = $true)][string]$DisplayName
+    )
+
+    $projectPath = Join-Path $RepoRoot $ProjectRelativePath
+    $cargoTomlPath = Join-Path $projectPath "Cargo.toml"
+
+    if (-not (Test-Path -Path $cargoTomlPath)) {
+        Write-Host "$DisplayName crate not found at $projectPath. Skipping."
+        return
+    }
+
+    $cargoPath = Resolve-CargoPath
+
+    Push-Location $projectPath
+    try {
+        & $cargoPath build --release
+        if ($LASTEXITCODE -ne 0) {
+            throw "$DisplayName build failed with exit code $LASTEXITCODE."
+        }
+    }
+    finally {
+        Pop-Location
+    }
+
+    $extensionOutputPath = Join-Path $projectPath "target\release"
+    Set-Item -Path ("Env:" + $EnvironmentVariableName) -Value $extensionOutputPath
+    Write-Host ("Using {0}={1}" -f $EnvironmentVariableName, $extensionOutputPath)
+}
+
+function Invoke-RustNativeExtensionsBuild {
+    Invoke-RustNativeExtensionBuild -ProjectRelativePath "rust\ffiimpl" -EnvironmentVariableName "CHAKRA_RUST_FFI_PATH" -DisplayName "Rust FFI"
+    Invoke-RustNativeExtensionBuild -ProjectRelativePath "rust\httpserver" -EnvironmentVariableName "CHAKRA_RUST_HTTP_SERVER_PATH" -DisplayName "Rust HTTP server"
+}
+
 function Invoke-RustRuntimeBuild {
     param([Parameter(Mandatory = $true)][string]$BuildConfiguration)
 
@@ -470,6 +508,24 @@ function Invoke-CreateDistLayout {
         Copy-ArtifactIfExists -SourcePath (Join-Path $rustPackagesOutputPath $rustPackageArtifact) -DestinationDirectory $distPath
     }
 
+    $rustFfiOutputPath = $env:CHAKRA_RUST_FFI_PATH
+    if ([string]::IsNullOrWhiteSpace($rustFfiOutputPath)) {
+        $rustFfiOutputPath = Join-Path $RepoRoot "rust\ffiimpl\target\release"
+    }
+
+    foreach ($rustFfiArtifact in @("chakra_ffi.dll", "chakra_ffi.lib", "chakra_ffi.pdb")) {
+        Copy-ArtifactIfExists -SourcePath (Join-Path $rustFfiOutputPath $rustFfiArtifact) -DestinationDirectory $distPath
+    }
+
+    $rustHttpServerOutputPath = $env:CHAKRA_RUST_HTTP_SERVER_PATH
+    if ([string]::IsNullOrWhiteSpace($rustHttpServerOutputPath)) {
+        $rustHttpServerOutputPath = Join-Path $RepoRoot "rust\httpserver\target\release"
+    }
+
+    foreach ($rustHttpServerArtifact in @("chakra_httpserver.dll", "chakra_httpserver.lib", "chakra_httpserver.pdb")) {
+        Copy-ArtifactIfExists -SourcePath (Join-Path $rustHttpServerOutputPath $rustHttpServerArtifact) -DestinationDirectory $distPath
+    }
+
     Copy-ArtifactIfExists -SourcePath (Join-Path $RepoRoot "LICENSE.txt") -DestinationDirectory $distPath -Required
     Copy-ArtifactIfExists -SourcePath (Join-Path $RepoRoot "THIRD-PARTY-NOTICES.txt") -DestinationDirectory $distPath -Required
     Copy-ArtifactIfExists -SourcePath (Join-Path $RepoRoot "README.md") -DestinationDirectory $distPath
@@ -486,7 +542,9 @@ function Invoke-CreateDistLayout {
         "Platform=$BuildPlatform",
         "BinOutput=$binOutputPath",
         "RustRuntime=$RustRuntimeExePath",
-        "RustPackages=$rustPackagesOutputPath"
+        "RustPackages=$rustPackagesOutputPath",
+        "RustFfi=$rustFfiOutputPath",
+        "RustHttpServer=$rustHttpServerOutputPath"
     )
     Set-Content -Path $distInfoPath -Value $distInfoLines -Encoding Ascii
 
@@ -505,6 +563,9 @@ try {
 
     Write-Step "Building Rust package crate first"
     Invoke-RustPackageBuild
+
+    Write-Step "Building Rust native extension crates (ffi + httpserver)"
+    Invoke-RustNativeExtensionsBuild
 
     Write-Step "Building Rust runtime host"
     $rustRuntimeExePath = Invoke-RustRuntimeBuild -BuildConfiguration $Configuration

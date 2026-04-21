@@ -126,6 +126,48 @@ BUILD_RUST_PACKAGES() {
     echo "CHAKRA_RUST_PACKAGES_PATH=$CHAKRA_RUST_PACKAGES_PATH"
 }
 
+BUILD_RUST_NATIVE_EXTENSION() {
+    local PROJECT_DIR="$1"
+    local ENV_VAR_NAME="$2"
+    local DISPLAY_NAME="$3"
+
+    if [[ -z "$PROJECT_DIR" || -z "$ENV_VAR_NAME" || -z "$DISPLAY_NAME" ]]; then
+        echo "ERROR: BUILD_RUST_NATIVE_EXTENSION requires project directory, env var name, and display name."
+        exit 1
+    fi
+
+    if [[ ! -f "$PROJECT_DIR/Cargo.toml" ]]; then
+        echo "$DISPLAY_NAME crate not found at '$PROJECT_DIR'. Skipping."
+        return
+    fi
+
+    local CARGO_PATH=$(which cargo 2> /dev/null)
+    if [[ -z "$CARGO_PATH" || ! -x "$CARGO_PATH" ]]; then
+        echo "ERROR: cargo not found. Install Rust toolchain to build $DISPLAY_NAME."
+        exit 1
+    fi
+
+    echo "Building $DISPLAY_NAME crate at $PROJECT_DIR"
+    pushd "$PROJECT_DIR" > /dev/null
+    $CARGO_PATH build --release
+    local RUST_RET=$?
+    popd > /dev/null
+
+    if [[ $RUST_RET != 0 ]]; then
+        echo "ERROR: $DISPLAY_NAME build failed with exit code $RUST_RET"
+        exit $RUST_RET
+    fi
+
+    local OUTPUT_PATH="$PROJECT_DIR/target/release"
+    export "$ENV_VAR_NAME=$OUTPUT_PATH"
+    echo "$ENV_VAR_NAME=$OUTPUT_PATH"
+}
+
+BUILD_RUST_NATIVE_EXTENSIONS() {
+    BUILD_RUST_NATIVE_EXTENSION "$CHAKRACORE_DIR/rust/ffiimpl" "CHAKRA_RUST_FFI_PATH" "Rust FFI"
+    BUILD_RUST_NATIVE_EXTENSION "$CHAKRACORE_DIR/rust/httpserver" "CHAKRA_RUST_HTTP_SERVER_PATH" "Rust HTTP server"
+}
+
 BUILD_RUST_RUNTIME() {
     local RUST_RUNTIME_DIR="$CHAKRACORE_DIR/rust/runtime"
     if [[ ! -d "$RUST_RUNTIME_DIR" ]]; then
@@ -190,6 +232,14 @@ STAGE_LINUX_OUTPUT() {
 
     if [[ -n "$CHAKRA_RUST_PACKAGES_PATH" && -f "$CHAKRA_RUST_PACKAGES_PATH/libchakra_packages.so" ]]; then
         cp "$CHAKRA_RUST_PACKAGES_PATH/libchakra_packages.so" "$LINUX_STAGE_DIR/"
+    fi
+
+    if [[ -n "$CHAKRA_RUST_FFI_PATH" && -f "$CHAKRA_RUST_FFI_PATH/libchakra_ffi.so" ]]; then
+        cp "$CHAKRA_RUST_FFI_PATH/libchakra_ffi.so" "$LINUX_STAGE_DIR/"
+    fi
+
+    if [[ -n "$CHAKRA_RUST_HTTP_SERVER_PATH" && -f "$CHAKRA_RUST_HTTP_SERVER_PATH/libchakra_httpserver.so" ]]; then
+        cp "$CHAKRA_RUST_HTTP_SERVER_PATH/libchakra_httpserver.so" "$LINUX_STAGE_DIR/"
     fi
 
     if [[ -n "$CHAKRA_RUST_RUNTIME_PATH" && -f "$CHAKRA_RUST_RUNTIME_PATH" ]]; then
@@ -737,6 +787,7 @@ fi
 # Rust-backed host packages must be built before building ch so runtime require("chakra:...") is ready.
 if [[ ! $TARGET_OS =~ "CC_TARGET_OS_ANDROID_SH=1" ]]; then
     BUILD_RUST_PACKAGES
+    BUILD_RUST_NATIVE_EXTENSIONS
     BUILD_RUST_RUNTIME
 fi
 
