@@ -2018,6 +2018,54 @@ JsGetEmbedderData(_In_ JsValueRef instance, _Out_ JsValueRef* embedderData);
 CHAKRA_API
 JsSetEmbedderData(_In_ JsValueRef instance, _In_ JsValueRef embedderData);
 
+/// <summary>
+///     Installs a host-level require function on the current global object to expose built-in
+///     Chakra system packages: chakra:info, chakra:fs, chakra:reqwest, chakra:es2020, chakra:es2021.
+/// </summary>
+/// <param name="requireFunction">Optional. Returns the installed require function.</param>
+/// <returns>
+///     The code <c>JsNoError</c> if the operation succeeded, a failure code otherwise.
+/// </returns>
+CHAKRA_API
+JsInstallChakraSystemRequire(_Out_opt_ JsValueRef* requireFunction);
+
+/// <summary>
+///     Resolves a Chakra system package object by module name.
+/// </summary>
+/// <param name="moduleName">A string value such as "chakra:es2021".</param>
+/// <param name="packageObject">The package exports object.</param>
+/// <returns>
+///     The code <c>JsNoError</c> if the operation succeeded, a failure code otherwise.
+/// </returns>
+CHAKRA_API
+JsRequireChakraSystemPackage(
+    _In_ JsValueRef moduleName,
+    _Out_ JsValueRef* packageObject);
+
+/// <summary>
+///     Analyzes source text using the Rust-backed ES2020 analyzer and returns the analysis object.
+/// </summary>
+CHAKRA_API
+JsChakraEs2020Analyze(
+    _In_ JsValueRef source,
+    _Out_ JsValueRef* analysisResult);
+
+/// <summary>
+///     Analyzes source text using the Rust-backed ES2021 analyzer and returns the analysis object.
+/// </summary>
+CHAKRA_API
+JsChakraEs2021Analyze(
+    _In_ JsValueRef source,
+    _Out_ JsValueRef* analysisResult);
+
+/// <summary>
+///     Transforms source text using the Rust-backed ES2021 transformer and returns transformed source.
+/// </summary>
+CHAKRA_API
+JsChakraEs2021Transform(
+    _In_ JsValueRef source,
+    _Out_ JsValueRef* transformedSource);
+
 #ifdef _WIN32
 #include "ChakraCoreWindows.h"
 #endif // _WIN32

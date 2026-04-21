@@ -32,6 +32,12 @@ Export currently available:
 - `chakra_es2021_analyze` used by `require("chakra:es2021").analyze(source)`
 - `chakra_es2021_transform` used by host runtime fallback for ES2021 logical assignment syntax
 
+ChakraCore.dll now also exposes embedder-facing JSRT helpers to surface these packages without `ch.exe`:
+
+- `JsInstallChakraSystemRequire` installs `require("chakra:...")` on the current global object
+- `JsRequireChakraSystemPackage` gets a package object directly by module name
+- `JsChakraEs2020Analyze` / `JsChakraEs2021Analyze` / `JsChakraEs2021Transform` provide direct ES APIs
+
 ## Source layout
 
 The crate is split by module under `src/`:

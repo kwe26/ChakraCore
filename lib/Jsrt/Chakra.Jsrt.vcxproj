@@ -42,6 +42,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="$(MSBuildThisFileDirectory)Jsrt.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)JsrtChakraExtensions.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)JsrtContext.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)JsrtDebugManager.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)JsrtDebugEventObject.cpp" />

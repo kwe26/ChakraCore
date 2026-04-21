@@ -175,4 +175,9 @@
     JsVarSerializerSetTransferableVars
     JsVarSerializerWriteRawBytes
     JsVarSerializerWriteValue
+    JsInstallChakraSystemRequire
+    JsRequireChakraSystemPackage
+    JsChakraEs2020Analyze
+    JsChakraEs2021Analyze
+    JsChakraEs2021Transform
 #endif
