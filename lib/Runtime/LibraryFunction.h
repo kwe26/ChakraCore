@@ -32,6 +32,7 @@ LIBRARY_FUNCTION(JavascriptString,        LastIndexOf,        3,    BIF_UseSrc0 
 LIBRARY_FUNCTION(JavascriptString,        Link,               2,    BIF_UseSrc0                                       , JavascriptString::EntryInfo::Link)
 LIBRARY_FUNCTION(JavascriptString,        Match,              2,    BIF_UseSrc0 | BIF_IgnoreDst                       , JavascriptString::EntryInfo::Match)
 LIBRARY_FUNCTION(JavascriptString,        Replace,            3,    BIF_UseSrc0 | BIF_IgnoreDst                       , JavascriptString::EntryInfo::Replace)
+LIBRARY_FUNCTION(JavascriptString,        ReplaceAll,         3,    BIF_UseSrc0 | BIF_IgnoreDst                       , JavascriptString::EntryInfo::ReplaceAll)
 LIBRARY_FUNCTION(JavascriptString,        Search,             2,    BIF_UseSrc0                                       , JavascriptString::EntryInfo::Search)
 LIBRARY_FUNCTION(JavascriptString,        Slice,              3,    BIF_UseSrc0 | BIF_VariableArgsNumber              , JavascriptString::EntryInfo::Slice )
 LIBRARY_FUNCTION(JavascriptString,        Split,              3,    BIF_UseSrc0 | BIF_VariableArgsNumber | BIF_IgnoreDst , JavascriptString::EntryInfo::Split)

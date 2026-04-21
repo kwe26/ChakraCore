@@ -18,8 +18,8 @@ if (flagA !== 9 || flagB !== 2 || fallback !== 11) {
     throw new Error("Logical assignment operators failed in this runtime");
 }
 
-print("remaining=" + remaining);
-print("logical-assignments=" + flagA + "," + flagB + "," + fallback);
+console.log("remaining=" + remaining);
+console.log("logical-assignments=" + flagA + "," + flagB + "," + fallback);
 
 if (typeof Promise.any !== "function") {
     throw new Error("Promise.any is unavailable in this Chakra build");
@@ -31,8 +31,8 @@ Promise.any([
     Promise.resolve("backup-winner")
 ]).then(
     function(value) {
-        print("Promise.any result=" + value);
-        print("es2021.js passed");
+        console.log("Promise.any result=" + value);
+        console.log("es2021.js passed");
     },
     function(error) {
         throw new Error("Promise.any unexpectedly rejected: " + error);

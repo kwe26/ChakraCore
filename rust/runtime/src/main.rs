@@ -11,6 +11,7 @@ use std::env;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::ptr;
@@ -157,6 +158,7 @@ struct ConsoleCallbackStateEx {
     api:    *const ChakraApi,
     kind:   ConsoleMethodKind,
     shared: *mut ConsoleSharedState,
+    color_enabled: bool,
 }
 
 // ─── HostRuntime ─────────────────────────────────────────────────────────────
@@ -164,6 +166,7 @@ struct ConsoleCallbackStateEx {
 struct HostRuntime {
     api:                    ChakraApi,
     runtime:                JsRuntimeHandle,
+    color_enabled:          bool,
     // keep alive
     _print_state:           Box<PrintCallbackState>,
     _console_states:        Vec<Box<ConsoleCallbackStateEx>>,
@@ -174,6 +177,58 @@ struct HostRuntime {
 
 struct ReplHelper {
     keywords: &'static [&'static str],
+    color_enabled: bool,
+}
+
+fn supports_color() -> bool {
+    if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+
+    if env::var_os("FORCE_COLOR").is_some() {
+        return true;
+    }
+
+    if !std::io::stdout().is_terminal() && !std::io::stderr().is_terminal() {
+        return false;
+    }
+
+    if cfg!(windows) {
+        if env::var_os("WT_SESSION").is_some() || env::var_os("ANSICON").is_some() {
+            return true;
+        }
+
+        if env::var("ConEmuANSI").map(|value| value.eq_ignore_ascii_case("ON")).unwrap_or(false) {
+            return true;
+        }
+
+        if let Ok(term) = env::var("TERM") {
+            let term = term.to_ascii_lowercase();
+            if term.contains("xterm") || term.contains("ansi") || term.contains("vscode") || term.contains("cygwin") {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    true
+}
+
+fn colorize(enabled: bool, code: &str, text: &str) -> String {
+    if enabled {
+        format!("\x1b[{}m{}\x1b[0m", code, text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn clear_terminal(enabled: bool) {
+    if enabled {
+        print!("\x1b[2J\x1b[H");
+    } else {
+        print!("\n");
+    }
 }
 
 impl Helper for ReplHelper {}
@@ -197,13 +252,21 @@ impl Validator for ReplHelper {
 
 impl Highlighter for ReplHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        Cow::Owned(highlight_js_line(line, self.keywords))
+        Cow::Owned(highlight_js_line(line, self.keywords, self.color_enabled))
     }
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, _default: bool) -> Cow<'b, str> {
-        Cow::Owned(format!("\x1b[1;32m{}\x1b[0m", prompt))
+        if self.color_enabled {
+            Cow::Owned(format!("\x1b[1;32m{}\x1b[0m", prompt))
+        } else {
+            Cow::Borrowed(prompt)
+        }
     }
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Owned(format!("\x1b[2m{}\x1b[0m", hint))
+        if self.color_enabled {
+            Cow::Owned(format!("\x1b[2m{}\x1b[0m", hint))
+        } else {
+            Cow::Borrowed(hint)
+        }
     }
 }
 
@@ -259,13 +322,13 @@ unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_
         // ── warn ─────────────────────────────────────────────────────────────
         ConsoleMethodKind::Warn => {
             let text = collect_args_as_string(api, args, argc, 1, " ");
-            eprintln!("{}\x1b[33m[warn]\x1b[0m {}", indent, text);
+            eprintln!("{}{} {}", indent, colorize(s.color_enabled, "33", "[warn]"), text);
         }
 
         // ── error ─────────────────────────────────────────────────────────────
         ConsoleMethodKind::Error => {
             let text = collect_args_as_string(api, args, argc, 1, " ");
-            eprintln!("{}\x1b[31m[error]\x1b[0m {}", indent, text);
+            eprintln!("{}{} {}", indent, colorize(s.color_enabled, "31", "[error]"), text);
         }
 
         // ── trace ─────────────────────────────────────────────────────────────
@@ -275,7 +338,7 @@ unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_
             } else {
                 "Trace".to_string()
             };
-            eprintln!("{}\x1b[35m[trace]\x1b[0m {}", indent, text);
+            eprintln!("{}{} {}", indent, colorize(s.color_enabled, "35", "[trace]"), text);
             // A real stack trace would require JsGetStackTrace — print a note instead
             eprintln!("{}  (stack trace not available in this host)", indent);
         }
@@ -294,7 +357,7 @@ unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_
                 } else {
                     "Assertion failed".to_string()
                 };
-                eprintln!("{}\x1b[31m[assert]\x1b[0m {}", indent, msg);
+                eprintln!("{}{} {}", indent, colorize(s.color_enabled, "31", "[assert]"), msg);
             }
         }
 
@@ -311,7 +374,7 @@ unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_
             // Best-effort: stringify the value and print it
             if argc > 1 {
                 let text = value_to_string(api, *args.add(1)).unwrap_or_else(|e| format!("<{}>", e));
-                println!("{}\x1b[1m[table]\x1b[0m {}", indent, text);
+                println!("{}{} {}", indent, colorize(s.color_enabled, "1", "[table]"), text);
             }
         }
 
@@ -357,7 +420,7 @@ unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_
                 let elapsed = start.elapsed();
                 println!("{}{}: {:.3}ms", indent, label, elapsed.as_secs_f64() * 1000.0);
             } else {
-                eprintln!("{}\x1b[33m[timer]\x1b[0m No such timer: '{}'", indent, label);
+                eprintln!("{}{} No such timer: '{}'", indent, colorize(s.color_enabled, "33", "[timer]"), label);
             }
         }
 
@@ -371,7 +434,7 @@ unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_
                 let elapsed = start.elapsed();
                 println!("{}{}: {:.3}ms", indent, label, elapsed.as_secs_f64() * 1000.0);
             } else {
-                eprintln!("{}\x1b[33m[timer]\x1b[0m No such timer: '{}'", indent, label);
+                eprintln!("{}{} No such timer: '{}'", indent, colorize(s.color_enabled, "33", "[timer]"), label);
             }
         }
 
@@ -383,7 +446,7 @@ unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_
                 String::new()
             };
             if !label.is_empty() {
-                println!("{}\x1b[1m{}\x1b[0m", indent, label);
+                println!("{}{}", indent, colorize(s.color_enabled, "1", &label));
             }
             shared.group_depth += 1;
         }
@@ -397,7 +460,7 @@ unsafe fn console_callback_impl(args: *mut JsValueRef, argc: u16, state: *mut c_
         // ── clear ─────────────────────────────────────────────────────────────
         ConsoleMethodKind::Clear => {
             // ANSI clear screen + move cursor to top
-            print!("\x1b[2J\x1b[H");
+            clear_terminal(s.color_enabled);
         }
     }
 
@@ -539,6 +602,7 @@ impl HostRuntime {
         let mut host = Box::new(Self {
             api,
             runtime,
+            color_enabled: supports_color(),
             // Placeholder — real pointer patched in step 2.
             _print_state: Box::new(PrintCallbackState { api: ptr::null() }),
             _console_states: Vec::new(),
@@ -658,6 +722,7 @@ impl HostRuntime {
                 api: api_ptr,
                 kind,
                 shared: shared_ptr,
+                color_enabled: self.color_enabled,
             });
             let cb_ptr = state.as_ref() as *const ConsoleCallbackStateEx as *mut c_void;
             self._console_states.push(state);
@@ -739,14 +804,16 @@ impl HostRuntime {
     // ── REPL ─────────────────────────────────────────────────────────────────
 
     fn run_repl(&self) -> Result<(), String> {
-        let helper = ReplHelper { keywords: JS_KEYWORDS };
+        let helper = ReplHelper { keywords: JS_KEYWORDS, color_enabled: self.color_enabled };
         let mut editor: Editor<ReplHelper, rustyline::history::DefaultHistory> =
             Editor::new().map_err(|e| format!("Editor init failed: {}", e))?;
         editor.set_helper(Some(helper));
         let _ = editor.load_history(".chakra_history");
 
-        println!("\x1b[1;36mChakraCore REPL\x1b[0m");
-        println!("Type \x1b[1m.help\x1b[0m for available commands, \x1b[1m.exit\x1b[0m or Ctrl-D to quit.\n");
+        println!("{}", colorize(self.color_enabled, "1;36", "ChakraCore REPL"));
+        println!("Type {} for available commands, {} or Ctrl-D to quit.\n",
+            colorize(self.color_enabled, "1", ".help"),
+            colorize(self.color_enabled, "1", ".exit"));
 
         // Unique monotonic source context
         static CTX: AtomicUsize = AtomicUsize::new(1);
@@ -765,7 +832,7 @@ impl HostRuntime {
                             ReplCommand::Exit     => break,
                             ReplCommand::Handled  => continue,
                             ReplCommand::Unknown  => {
-                                eprintln!("\x1b[33mUnknown command: {}\x1b[0m  (try .help)", trimmed);
+                                eprintln!("{}  (try .help)", colorize(self.color_enabled, "33", &format!("Unknown command: {}", trimmed)));
                                 continue;
                             }
                         }
@@ -791,13 +858,13 @@ impl HostRuntime {
                         Ok(result) => {
                             if !is_undefined_value(&self.api, result) {
                                 match value_to_string(&self.api, result) {
-                                    Ok(s) if !s.is_empty() => println!("\x1b[1;36m{}\x1b[0m", s),
+                                    Ok(s) if !s.is_empty() => println!("{}", colorize(self.color_enabled, "1;36", &s)),
                                     Ok(_)  => {}
                                     Err(e) => eprintln!("result error: {}", e),
                                 }
                             }
                         }
-                        Err(e) => eprintln!("\x1b[31m{}\x1b[0m", e),
+                        Err(e) => eprintln!("{}", colorize(self.color_enabled, "31", &e)),
                     }
                 }
 
@@ -811,7 +878,7 @@ impl HostRuntime {
         }
 
         let _ = editor.save_history(".chakra_history");
-        println!("\x1b[2mBye!\x1b[0m");
+        println!("{}", colorize(self.color_enabled, "2", "Bye!"));
         Ok(())
     }
 
@@ -829,37 +896,37 @@ impl HostRuntime {
             ".exit" | ".quit" => ReplCommand::Exit,
 
             ".help" => {
-                println!("\x1b[1mAvailable REPL commands:\x1b[0m");
-                println!("  \x1b[1m.help\x1b[0m              Show this help");
-                println!("  \x1b[1m.exit\x1b[0m / \x1b[1m.quit\x1b[0m     Exit the REPL");
-                println!("  \x1b[1m.load <file>\x1b[0m       Load and execute a JavaScript file");
-                println!("  \x1b[1m.type <expr>\x1b[0m       Show the JS type of an expression");
-                println!("  \x1b[1m.clear\x1b[0m             Clear the screen");
-                println!("  \x1b[1m.history\x1b[0m           Show command history");
-                println!("  \x1b[1m.reset\x1b[0m             Print a reminder (runtime cannot be hot-reset)");
-                println!("  \x1b[1m.version\x1b[0m           Show runtime version info");
+                println!("{}", colorize(self.color_enabled, "1", "Available REPL commands:"));
+                println!("  {}              Show this help", colorize(self.color_enabled, "1", ".help"));
+                println!("  {} / {}     Exit the REPL", colorize(self.color_enabled, "1", ".exit"), colorize(self.color_enabled, "1", ".quit"));
+                println!("  {}       Load and execute a JavaScript file", colorize(self.color_enabled, "1", ".load <file>"));
+                println!("  {}       Show the JS type of an expression", colorize(self.color_enabled, "1", ".type <expr>"));
+                println!("  {}             Clear the screen", colorize(self.color_enabled, "1", ".clear"));
+                println!("  {}           Show command history", colorize(self.color_enabled, "1", ".history"));
+                println!("  {}             Print a reminder (runtime cannot be hot-reset)", colorize(self.color_enabled, "1", ".reset"));
+                println!("  {}           Show runtime version info", colorize(self.color_enabled, "1", ".version"));
                 ReplCommand::Handled
             }
 
             ".load" => {
                 if arg.is_empty() {
-                    eprintln!("\x1b[33mUsage: .load <path/to/file.js>\x1b[0m");
+                    eprintln!("{}", colorize(self.color_enabled, "33", "Usage: .load <path/to/file.js>"));
                     return ReplCommand::Handled;
                 }
                 let path = Path::new(arg);
                 match fs::read_to_string(path) {
-                    Err(e) => eprintln!("\x1b[31mFailed to read '{}': {}\x1b[0m", arg, e),
+                    Err(e) => eprintln!("{}", colorize(self.color_enabled, "31", &format!("Failed to read '{}': {}", arg, e))),
                     Ok(source) => {
-                        println!("\x1b[2mLoading {}…\x1b[0m", arg);
+                        println!("{}", colorize(self.color_enabled, "2", &format!("Loading {}…", arg)));
                         match self.run_script_source(&source, arg) {
                             Ok(result) => {
                                 if !is_undefined_value(&self.api, result) {
                                     if let Ok(s) = value_to_string(&self.api, result) {
-                                        if !s.is_empty() { println!("\x1b[1;36m{}\x1b[0m", s); }
+                                        if !s.is_empty() { println!("{}", colorize(self.color_enabled, "1;36", &s)); }
                                     }
                                 }
                             }
-                            Err(e) => eprintln!("\x1b[31m{}\x1b[0m", e),
+                            Err(e) => eprintln!("{}", colorize(self.color_enabled, "31", &e)),
                         }
                     }
                 }
@@ -868,22 +935,22 @@ impl HostRuntime {
 
             ".type" => {
                 if arg.is_empty() {
-                    eprintln!("\x1b[33mUsage: .type <expression>\x1b[0m");
+                    eprintln!("{}", colorize(self.color_enabled, "33", "Usage: .type <expression>"));
                     return ReplCommand::Handled;
                 }
                 let snippet = format!("typeof ({})", arg);
                 match self.run_script_source(&snippet, "<type>") {
                     Ok(v) => {
                         let t = value_to_string(&self.api, v).unwrap_or_else(|_| "?".into());
-                        println!("\x1b[1;33m{}\x1b[0m", t);
+                        println!("{}", colorize(self.color_enabled, "1;33", &t));
                     }
-                    Err(e) => eprintln!("\x1b[31m{}\x1b[0m", e),
+                    Err(e) => eprintln!("{}", colorize(self.color_enabled, "31", &e)),
                 }
                 ReplCommand::Handled
             }
 
             ".clear" => {
-                print!("\x1b[2J\x1b[H");
+                clear_terminal(self.color_enabled);
                 ReplCommand::Handled
             }
 
@@ -895,7 +962,7 @@ impl HostRuntime {
             }
 
             ".reset" => {
-                eprintln!("\x1b[33mNote: live runtime reset is not supported. Restart the process to get a fresh context.\x1b[0m");
+                eprintln!("{}", colorize(self.color_enabled, "33", "Note: live runtime reset is not supported. Restart the process to get a fresh context."));
                 ReplCommand::Handled
             }
 
@@ -1078,7 +1145,11 @@ fn js_source_needs_more_input(source: &str) -> bool {
 
 // ─── Syntax highlighter ───────────────────────────────────────────────────────
 
-fn highlight_js_line(line: &str, keywords: &[&str]) -> String {
+fn highlight_js_line(line: &str, keywords: &[&str], color_enabled: bool) -> String {
+    if !color_enabled {
+        return line.to_string();
+    }
+
     let mut out = String::with_capacity(line.len() + 64);
     let mut chars = line.chars().peekable();
     let mut in_single = false;

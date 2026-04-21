@@ -8,6 +8,7 @@
 #include "DataStructures/BigUInt.h"
 #include "Library/EngineInterfaceObject.h"
 #include "Library/IntlEngineInterfaceExtensionObject.h"
+#include "RegexPattern.h"
 
 #if ENABLE_NATIVE_CODEGEN
 #include "../Backend/JITRecyclableObject.h"
@@ -1667,6 +1668,115 @@ case_2:
             return DoStringReplace(args, callInfo, stringObj, scriptContext);
         };
         return DelegateToRegExSymbolFunction<2>(args, PropertyIds::_symbolReplace, fallback, varName, scriptContext);
+    }
+
+    Var JavascriptString::EntryReplaceAll(RecyclableObject* function, CallInfo callInfo, ...)
+    {
+        PROBE_STACK(function->GetScriptContext(), Js::Constants::MinStackDefault);
+
+        ARGUMENTS(args, callInfo);
+        ScriptContext* scriptContext = function->GetScriptContext();
+
+        PCWSTR const varName = _u("String.prototype.replaceAll");
+
+        AUTO_TAG_NATIVE_LIBRARY_ENTRY(function, callInfo, varName);
+
+        Assert(!(callInfo.Flags & CallFlags_New));
+
+        JavascriptString* pThis = nullptr;
+        GetThisStringArgument(args, scriptContext, varName, &pThis);
+
+        JavascriptRegExp* pRegEx = nullptr;
+        JavascriptString* pSearch = nullptr;
+        SearchValueHelper(scriptContext, ((args.Info.Count > 1) ? args[1] : scriptContext->GetLibrary()->GetNull()), &pRegEx, &pSearch);
+
+        JavascriptString* pReplace = nullptr;
+        RecyclableObject* replacefn = nullptr;
+        ReplaceValueHelper(scriptContext, ((args.Info.Count > 2) ? args[2] : scriptContext->GetLibrary()->GetUndefined()), &replacefn, &pReplace);
+
+        if (pRegEx != nullptr)
+        {
+            if (!pRegEx->GetPattern()->IsGlobal())
+            {
+                JavascriptError::ThrowTypeError(scriptContext, JSERR_FunctionArgument_Invalid, varName);
+            }
+
+            if (replacefn != nullptr)
+            {
+                return RegexHelper::RegexReplaceFunction(scriptContext, pRegEx, pThis, replacefn);
+            }
+
+            return RegexHelper::RegexReplace(scriptContext, pRegEx, pThis, pReplace, RegexHelper::IsResultNotUsed(callInfo.Flags));
+        }
+
+        const CharCount inputLength = pThis->GetLength();
+        const CharCount searchLength = pSearch->GetLength();
+        const char16* inputStr = pThis->GetString();
+
+        CompoundString::Builder<64 * sizeof(void *) / sizeof(char16)> concatenated(scriptContext);
+        ThreadContext* threadContext = scriptContext->GetThreadContext();
+
+        auto appendReplacement = [&](CharCount matchIndex)
+        {
+            if (replacefn != nullptr)
+            {
+                Var replaceVar = threadContext->ExecuteImplicitCall(replacefn, ImplicitCall_Accessor, [=]() -> Js::Var
+                {
+                    Var pThisValue = scriptContext->GetLibrary()->GetUndefined();
+                    return CALL_FUNCTION(threadContext, replacefn, CallInfo(4), pThisValue, pSearch, JavascriptNumber::ToVar((int)matchIndex, scriptContext), pThis);
+                });
+
+                JavascriptString* replacementString = JavascriptConversion::ToString(replaceVar, scriptContext);
+                concatenated.Append(replacementString);
+            }
+            else
+            {
+                concatenated.Append(pReplace);
+            }
+        };
+
+        if (searchLength == 0)
+        {
+            CharCount lastIndex = 0;
+            for (CharCount matchIndex = 0; matchIndex <= inputLength; ++matchIndex)
+            {
+                concatenated.Append(pThis, lastIndex, matchIndex - lastIndex);
+                appendReplacement(matchIndex);
+                lastIndex = matchIndex;
+            }
+
+            concatenated.Append(pThis, lastIndex, inputLength - lastIndex);
+            return concatenated.ToString();
+        }
+
+        if (inputLength < searchLength)
+        {
+            return pThis;
+        }
+
+        CharCount searchIndex = 0;
+        bool foundMatch = false;
+        while (searchIndex <= inputLength - searchLength)
+        {
+            CharCount matchIndex = JavascriptString::strstr(pThis, pSearch, true, static_cast<uint>(searchIndex));
+            if (matchIndex == CharCountFlag)
+            {
+                break;
+            }
+
+            foundMatch = true;
+            concatenated.Append(pThis, searchIndex, matchIndex - searchIndex);
+            appendReplacement(matchIndex);
+            searchIndex = matchIndex + searchLength;
+        }
+
+        if (!foundMatch)
+        {
+            return pThis;
+        }
+
+        concatenated.Append(pThis, searchIndex, inputLength - searchIndex);
+        return concatenated.ToString();
     }
 
     Var JavascriptString::DoStringReplace(Arguments& args, CallInfo& callInfo, JavascriptString* input, ScriptContext* scriptContext)

@@ -4434,6 +4434,7 @@ namespace Js
         builtinFuncs[BuiltinFunction::JavascriptString_IndexOf]       = library->AddFunctionToLibraryObject(stringPrototype, PropertyIds::indexOf,            &JavascriptString::EntryInfo::IndexOf,              1);
         builtinFuncs[BuiltinFunction::JavascriptString_LastIndexOf]   = library->AddFunctionToLibraryObject(stringPrototype, PropertyIds::lastIndexOf,        &JavascriptString::EntryInfo::LastIndexOf,          1);
         builtinFuncs[BuiltinFunction::JavascriptString_Replace]       = library->AddFunctionToLibraryObject(stringPrototype, PropertyIds::replace,            &JavascriptString::EntryInfo::Replace,              2);
+        builtinFuncs[BuiltinFunction::JavascriptString_ReplaceAll]    = library->AddFunctionToLibraryObjectWithPropertyName(stringPrototype, _u("replaceAll"), &JavascriptString::EntryInfo::ReplaceAll,           2);
         builtinFuncs[BuiltinFunction::JavascriptString_Search]        = library->AddFunctionToLibraryObject(stringPrototype, PropertyIds::search,             &JavascriptString::EntryInfo::Search,               1);
         builtinFuncs[BuiltinFunction::JavascriptString_Slice]         = library->AddFunctionToLibraryObject(stringPrototype, PropertyIds::slice,              &JavascriptString::EntryInfo::Slice,                2);
 
@@ -7820,6 +7821,7 @@ namespace Js
         REG_OBJECTS_LIB_FUNC(indexOf, JavascriptString::EntryIndexOf);
         REG_OBJECTS_LIB_FUNC(lastIndexOf, JavascriptString::EntryLastIndexOf);
         REG_OBJECTS_LIB_FUNC(replace, JavascriptString::EntryReplace);
+        REG_OBJECTS_DYNAMIC_LIB_FUNC(_u("replaceAll"), 10, JavascriptString::EntryReplaceAll);
         REG_OBJECTS_LIB_FUNC(search, JavascriptString::EntrySearch);
         REG_OBJECTS_LIB_FUNC(slice, JavascriptString::EntrySlice);
         REG_OBJECTS_LIB_FUNC(charAt, JavascriptString::EntryCharAt);
